@@ -54,6 +54,10 @@ local CFG = {
     raidEnabled = false,
     raidBases = {},
     raidPriority = true,
+    raidEventEnabled = false,
+    raidEventBases = {},
+    raidEventArmy = 1,
+    raidEventDelay = 5,
     unclaimEnabled = false,
     unclaimBases = {},
     autoBuyEnabled = false,
@@ -98,10 +102,19 @@ local function killThread(name)
     end
 end
 
+local ALL_CP_TAGS = {
+    "CapturePoint",
+    "CapturePointKingOfTheHill",
+    "CapturePointToxicKingOfTheHill",
+    "CapturePointAlienKingOfTheHill",
+}
+
 local function findCP(name)
-    for _, cp in CollectionService:GetTagged("CapturePoint") do
-        if cp and cp.Parent and cp:IsDescendantOf(Workspace) and cp.Name == name then
-            return cp
+    for _, tag in ALL_CP_TAGS do
+        for _, cp in CollectionService:GetTagged(tag) do
+            if cp and cp.Parent and cp:IsDescendantOf(Workspace) and cp.Name == name then
+                return cp
+            end
         end
     end
     return nil
@@ -114,11 +127,13 @@ end
 local function getAllCPNames()
     local seen = {}
     local names = {}
-    for _, cp in CollectionService:GetTagged("CapturePoint") do
-        if cp and cp.Parent and cp:IsDescendantOf(Workspace) then
-            if not seen[cp.Name] then
-                seen[cp.Name] = true
-                table.insert(names, cp.Name)
+    for _, tag in ALL_CP_TAGS do
+        for _, cp in CollectionService:GetTagged(tag) do
+            if cp and cp.Parent and cp:IsDescendantOf(Workspace) then
+                if not seen[cp.Name] then
+                    seen[cp.Name] = true
+                    table.insert(names, cp.Name)
+                end
             end
         end
     end
@@ -177,24 +192,22 @@ local function waitConquered(cp, timeout)
     return isOwned(cp)
 end
 
-local ALL_CP_TAGS = {
-    "CapturePoint",
-    "CapturePointKingOfTheHill",
-    "CapturePointToxicKingOfTheHill",
-    "CapturePointAlienKingOfTheHill",
-}
-
 local WEATHER_EVENTS = {
     { id = "Storm",            label = "Storm",            baseTypes = {},                                tag = "CapturePoint" },
-    { id = "NuclearFallout",   label = "Nuclear Fallout",  baseTypes = {"RaidBase", "ToxicKingOfTheHill"},  tag = "CapturePoint" },
+    { id = "NuclearFallout",   label = "Nuclear Fallout",  baseTypes = {"RaidBase"},                      tag = "CapturePoint" },
     { id = "BeastBreach",      label = "Beast Breach",     baseTypes = {"MechBeast"},                      tag = "CapturePoint" },
     { id = "RobotUprising",    label = "Robot Uprising",   baseTypes = {"RobotBase"},                      tag = "CapturePoint" },
     { id = "Rebellion",        label = "Rebellion",        baseTypes = {"RaidBase"},                       tag = "CapturePoint" },
     { id = "OverStockCargoStorm", label = "Cargo Storm",  baseTypes = {"CargoBase"},                      tag = "CapturePoint" },
-    { id = "Invasion",         label = "Invasion",         baseTypes = {"KingOfTheHill"},                  tag = "CapturePoint" },
+    { id = "Invasion",         label = "Invasion",         baseTypes = {},                                 tag = "CapturePoint" },
     { id = "HackerOverride",   label = "Hacker Override",  baseTypes = {"HackerBase"},                     tag = "CapturePoint" },
     { id = "AlienInvasion",    label = "Alien Invasion",   baseTypes = {"AlienKingOfTheHill", "AlienInvasionBase"}, tag = "CapturePoint" },
     { id = "MeteorShower",     label = "Meteor Shower",    baseTypes = {"MeteorBase"},                     tag = "CapturePoint" },
+}
+
+local RAID_EVENTS = {
+    { id = "KingOfTheHill",    label = "King Of The Hill",      tag = "CapturePointKingOfTheHill",  baseType = "KingOfTheHill" },
+    { id = "ToxicKingOfTheHill", label = "Toxic King Of The Hill", tag = "CapturePointToxicKingOfTheHill", baseType = "ToxicKingOfTheHill" },
 }
 
 local REJOIN_LOADER = "NexusHub/rejoin_loader.luau"
@@ -280,6 +293,41 @@ local function startRaidLoop()
                 end
             end
             task.wait(CFG.attackDelay)
+        end
+    end)
+end
+
+local function startRaidEventLoop()
+    STATE.threads.raidEvent = task.spawn(function()
+        while isCurrentVersion() and CFG.raidEventEnabled do
+            local selectedLabels = CFG.raidEventBases
+            if #selectedLabels > 0 then
+                local activeTags = {}
+                for _, label in selectedLabels do
+                    for _, ev in RAID_EVENTS do
+                        if ev.label == label then
+                            activeTags[ev.tag] = true
+                        end
+                    end
+                end
+                if next(activeTags) then
+                    for _, ev in RAID_EVENTS do
+                        if not CFG.raidEventEnabled then break end
+                        if activeTags[ev.tag] then
+                            for _, cp in CollectionService:GetTagged(ev.tag) do
+                                if not CFG.raidEventEnabled then break end
+                                if cp and cp.Parent and cp:IsDescendantOf(Workspace) then
+                                    if not isOwned(cp) then
+                                        pcall(function() SendTroopsToPoint:Fire({ armyIndex = CFG.raidEventArmy, capturePoint = cp }) end)
+                                        if CFG.waitConquered then waitConquered(cp, 120) else task.wait(CFG.switchDelay) end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(CFG.raidEventDelay)
         end
     end)
 end
@@ -740,7 +788,7 @@ local function loadConfig(name)
 end
 
 local function applyConfig()
-    killThread("attack"); killThread("raid"); killThread("unclaim")
+    killThread("attack"); killThread("raid"); killThread("raidEvent"); killThread("unclaim")
     killThread("buySelected"); killThread("buyAll"); killThread("craft")
     killThread("claimBP"); killThread("claimAll"); killThread("antiAfk")
     killThread("rejoinDetect"); killThread("notifBlock")
@@ -756,6 +804,7 @@ local function applyConfig()
 
     if CFG.attackEnabled then startAttackLoop() end
     if CFG.raidEnabled then startRaidLoop() end
+    if CFG.raidEventEnabled then startRaidEventLoop() end
     if CFG.unclaimEnabled then startUnclaimLoop() end
     if CFG.autoBuyEnabled then startBuySelectedLoop() end
     if CFG.autoBuyAll then startBuyAllLoop() end
@@ -1010,6 +1059,55 @@ AttackTab:Button({
                 Icon = "cloud-off",
             })
         end
+    end,
+})
+
+AttackTab:Section({
+    Title = "Raid Events (KOTH / TKOTH)",
+    Icon = "flame",
+})
+
+local raidEventLabels = {}
+for _, ev in RAID_EVENTS do
+    table.insert(raidEventLabels, ev.label)
+end
+
+AttackTab:Dropdown({
+    Title = "Select Raid Events",
+    Desc = "Auto-attack KOTH and Toxic KOTH bases when they spawn",
+    Values = raidEventLabels,
+    Multi = true,
+    AllowNone = true,
+    Callback = function(sel)
+        CFG.raidEventBases = sel or {}
+    end,
+})
+
+UI_REFS.raidEventArmy = AttackTab:Dropdown({
+    Title = "Raid Event Army Slot",
+    Values = {"1", "2", "3", "4", "5"},
+    Value = "1",
+    Callback = function(sel)
+        CFG.raidEventArmy = tonumber(sel) or 1
+    end,
+})
+
+UI_REFS.raidEventDelay = AttackTab:Slider({
+    Title = "Raid Event Delay (sec)",
+    Desc = "Delay between raid event scan cycles",
+    Value = { Min = 1, Max = 60, Default = 5 },
+    Callback = function(v)
+        CFG.raidEventDelay = v
+    end,
+})
+
+UI_REFS.raidEventEnabled = AttackTab:Toggle({
+    Title = "Auto Raid Events",
+    Desc = "Attack KOTH and Toxic KOTH bases when they appear",
+    Value = false,
+    Callback = function(state)
+        CFG.raidEventEnabled = state
+        if state then startRaidEventLoop() else killThread("raidEvent") end
     end,
 })
 
