@@ -1,4 +1,11 @@
---[[ NEXUS HUB — Grow a Chicken Fighter ]]
+--[[ ============================================================
+     NEXUS HUB — Grow a Chicken Fighter
+     Organized: helpers -> loops (by category) -> UI build
+     ============================================================ ]]
+
+------------------------------------------------------------------
+-- Services & requires
+------------------------------------------------------------------
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
@@ -19,48 +26,54 @@ local FusionRules = require(ReplicatedStorage.Features.Chicken.FusionRules)
 local ChickenMode = require(Player.PlayerScripts.Features.Chicken.ChickenMode)
 
 -- Rayfield is shared globally so re-runs don't stack windows
-local Rayfield
-if not getgenv().NexusRayfield then
+local Rayfield = getgenv().NexusRayfield
+if not Rayfield then
     Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
     getgenv().NexusRayfield = Rayfield
-else
-    Rayfield = getgenv().NexusRayfield
 end
 
 local inv = Remotes.invoke
 local R = Remotes.defs
 local GC = GameConfig.generators
 
+------------------------------------------------------------------
+-- Config
+------------------------------------------------------------------
 local flags = {
     upgradeFeeder = false,
-    sendTower = false,
     buyFeeder = false,
+    sendTower = false,
     hatchEggs = false,
     collectEggs = false,
     rebirth = false,
-    antiAfk = false,
-    performance = false,
+    declineTowerContinue = false,
+    upgradeCoop = false,
+    upgradeRecycler = false,
+    autoIncubator = false,
+    autoClaimEggIncubator = false,
+    autoUpgradeIncubator = false,
+    autoFuse = false,
+    autoSell = false,
+    autoArena = false,
     claimMissions = false,
     claimDaily = false,
     claimRebirth = false,
     claimSocial = false,
-    autoRedeem = false,
-    upgradeCoop = false,
-    upgradeRecycler = false,
-    declineTowerContinue = false,
-    autoIncubator = false,
-    autoArena = false,
     autoClaimPass = false,
     autoRebirthSetting = false,
-    autoFuse = false,
     autoShopDust = false,
-    autoSell = false,
+    autoRedeem = false,
+    antiAfk = false,
     autoHotEgg = false,
+    performance = false,
 }
 
--- Current known-good codes (refreshed from community trackers). The server validates
--- each one for us: invalid/expired/already-used codes just return an error, so trying
--- the whole list every cycle is safe and only the valid, unredeemed ones grant rewards.
+-- Global hot egg state — set while egg is live so runSendTower pauses
+local hotEggActive = false
+
+local PIT_RADIUS = 40
+
+-- Current known-good codes (server validates each; only valid, unredeemed grant rewards)
 local knownCodes = {
     "BATTLEREADY",
     "ASCEND",
@@ -70,10 +83,12 @@ local knownCodes = {
     "SERGIOVERSE",
     "WELCOME",
 }
-local codes = {} -- optional extra codes added via the input box
+local codes = {}   -- optional extra codes added via the input box
 local redeemed = {} -- dedupe map so each code only fires once
 
--- helpers ---------------------------------------------------------------
+------------------------------------------------------------------
+-- Shared helpers
+------------------------------------------------------------------
 local function money()
     local ok, m = pcall(function() return client:get({"money"}) end)
     if ok and type(m) == "number" then return m end
@@ -110,7 +125,12 @@ local function incubatorData()
     return { eggs = {}, level = 0, progress = 0 }
 end
 
--- flat list of owned chickens (excluding eggs) with their ids
+local function rebirthCount()
+    local ok, rb = pcall(function() return client:get({"rebirth"}) end)
+    return (ok and type(rb) == "table" and rb.count) or 0
+end
+
+-- flat list of owned chickens (excluding eggs), with ids
 local function chickenList()
     local r = roster()
     local out = {}
@@ -133,64 +153,71 @@ local function getCharRoot()
     return c:FindFirstChild("HumanoidRootPart")
 end
 
--- per-toggle loops ------------------------------------------------------
+-- True only when the rooster is resting at the corral, mirroring the
+-- server's gate for rebirth (it rejects with "busyTower"/"notAtCoop").
+local function atCorral()
+    return ChickenMode.order() == "coop" and ChickenMode.where() == "corral"
+end
+
+------------------------------------------------------------------
+-- FARM loops
+------------------------------------------------------------------
+
 -- Auto Upgrade Feeder: raise every generator toward maxLevel, cheapest first
 local function runUpgradeFeeder()
     while getgenv().NX_HUB and flags.upgradeFeeder do
         local c = coop()
         local gens = c.generators or {}
-        local best, bestSlot, bestCost = 0, nil, nil
+        local bestSlot, bestCost = nil, nil
         for _, g in ipairs(gens) do
             if g.level and g.level < GC.maxLevel then
                 local cost = math.floor(GC.upgradeCost.base * (GC.upgradeCost.growth ^ math.max(0, g.level - 1)))
                 if bestSlot == nil or cost < bestCost then
-                    best, bestCost, bestSlot = g.level, cost, g.slot
+                    bestCost, bestSlot = cost, g.slot
                 end
             end
         end
         if bestSlot and money() >= (bestCost or 0) then
             pcallInvoke(R.UpgradeGenerator, bestSlot)
         end
-        task.wait(0.8)
+        task.wait(0.25)
     end
 end
 
--- Auto Send Tower: send when idle (full health)
-local function runSendTower()
-    while getgenv().NX_HUB and flags.sendTower do
-        local v = vitals()
-        if (v.health or 1) >= 0.999 then
-            task.spawn(function() pcallInvoke(R.TowerStart) end)
-            task.wait(2.5)
-        end
-        task.wait(0.7)
-    end
-end
-
--- Auto Buy Feeder: fill slots, expanding coop toward maxSlots when needed
+-- Auto Buy Feeder: fill slots, expanding the coop when a new slot is needed
 local function runBuyFeeder()
     while getgenv().NX_HUB and flags.buyFeeder do
         local c = coop()
         local gens = c.generators or {}
         local slots = c.slots or #gens
-        -- each generator owns a slot; first empty slot is next index
-        local cur = #gens
+        local cur = #gens -- each generator owns a slot; next index is first empty
         if cur < GC.maxSlots and cur >= slots then
-            -- need to expand coop to open another slot
+            -- need to expand the coop to open another slot
             local cost = math.floor(GC.expandCost.base * (GC.expandCost.growth ^ math.max(0, cur - GC.coopMinSize)))
             if money() >= cost then
                 pcallInvoke(R.ExpandCoop)
                 task.wait(1.5)
             end
         elseif cur < GC.maxSlots and cur < slots then
-            local nextSlot = cur + 1
             local cost = math.floor(GC.buyCost.base * (GC.buyCost.growth ^ math.max(0, cur - 1)))
             if money() >= cost then
-                pcallInvoke(R.BuyGenerator, nextSlot)
+                pcallInvoke(R.BuyGenerator, cur + 1)
                 task.wait(1.5)
             end
         end
         task.wait(1.0)
+    end
+end
+
+-- Auto Send Tower: send when idle (full health) — but not while a hot egg is live
+local function runSendTower()
+    while getgenv().NX_HUB and flags.sendTower do
+        local v = vitals()
+        if (v.health or 1) >= 0.999 and not hotEggActive then
+            task.spawn(function() pcallInvoke(R.TowerStart) end)
+            task.wait(2.5)
+        end
+        task.wait(0.7)
     end
 end
 
@@ -216,14 +243,12 @@ local function runCollectEggs()
         local eggs = CollectionService:GetTagged("NestEgg")
         for _, egg in ipairs(eggs) do
             if not getgenv().NX_HUB or not flags.collectEggs then break end
-            -- only collect eggs owned by the local player (laid by their chicken in their coop)
             if egg:GetAttribute("owner") ~= Player.UserId then continue end
             local hrp = getCharRoot()
             if hrp and egg:IsA("BasePart") then
                 local target = egg.Position
-                local dist = (hrp.Position - target).Magnitude
                 -- bring the character within ~4 studs
-                local ok = pcall(function()
+                pcall(function()
                     local bv = Instance.new("BodyVelocity")
                     bv.MaxForce = Vector3.new(1e6, 1e6, 1e6)
                     bv.Velocity = (target - hrp.Position).Unit * 40
@@ -248,54 +273,13 @@ local function runCollectEggs()
     end
 end
 
--- Auto Rebirth: rebirth when idle, at full health, AND at home so the server accepts it.
--- The server rejects rebirth unless the rooster is resting at the corral ("busyTower" /
--- "notAtCoop" errors), so we mirror the game's own gate: order=="coop" && where=="corral".
-local function atCorral()
-    return ChickenMode.order() == "coop" and ChickenMode.where() == "corral"
-end
-
+-- Auto Rebirth: rebuild when idle, at full health, and resting at the corral
 local function runRebirth()
     while getgenv().NX_HUB and flags.rebirth do
         local v = vitals()
-        local best = towerBest()
-        if atCorral() and best >= 1 and (v.health or 1) >= 0.999 then
+        if atCorral() and towerBest() >= 1 and (v.health or 1) >= 0.999 then
             pcallInvoke(R.Rebirth)
             task.wait(3)
-        end
-        task.wait(1.0)
-    end
-end
-
--- Auto Upgrade Coop: expand capacity/slots toward maxSlots when affordable
-local function runUpgradeCoop()
-    while getgenv().NX_HUB and flags.upgradeCoop do
-        local c = coop()
-        local slots = c.slots or 0
-        if slots < GC.maxSlots and CoopView.canExpand(slots) then
-            local cost = CoopView.expandCost(slots) or 0
-            if money() >= cost then
-                pcallInvoke(R.ExpandCoop)
-                task.wait(1.5)
-            end
-        end
-        task.wait(1.0)
-    end
-end
-
--- Auto Upgrade Recycler: raise recycler while affordable and unlocked
-local function runUpgradeRecycler()
-    while getgenv().NX_HUB and flags.upgradeRecycler do
-        local ok, scrap = pcall(function() return client:get({"scrap"}) end)
-        local level = (ok and scrap and scrap.recyclerLevel) or 0
-        local okR, rebirth = pcall(function() return client:get({"rebirth"}) end)
-        local rbCount = (okR and type(rebirth) == "table" and rebirth.count) or 0
-        local best = towerBest()
-        if RecyclerView.canUpgrade(level, rbCount)
-            and RecyclerView.floorUnlocked(level, best)
-            and money() >= (RecyclerView.upgradeCost(level) or 0) then
-            pcallInvoke(R.UpgradeRecycler)
-            task.wait(1.5)
         end
         task.wait(1.0)
     end
@@ -320,75 +304,39 @@ local function runDeclineTowerContinue()
     end
 end
 
--- Auto Claim Missions: claim every mission whose progress meets target
-local function missionStateData()
-    local ok, rb = pcall(function() return client:get({"rebirth"}) end)
-    local ok2, missions = pcall(function() return client:get({"missions"}) end)
-    return {
-        roster = roster(),
-        towerBest = towerBest(),
-        rebirthCount = (ok and type(rb) == "table" and rb.count) or 0,
-        recyclerLevel = 0,
-        missions = (ok2 and missions) or {},
-    }
-end
+------------------------------------------------------------------
+-- PROGRESSION loops
+------------------------------------------------------------------
 
-local function runClaimMissions()
-    while getgenv().NX_HUB and flags.claimMissions do
-        local md = missionStateData()
-        for _, scope in ipairs(MissionView.SCOPES) do
-            local act, aerr = pcall(MissionView.active, scope)
-            if type(act) == "table" then
-                for _, m in ipairs(act) do
-                    if m.kind == nil and MissionView.stateOf(md, m) == "ready" then
-                        pcallInvoke(R.MissionClaim, m.id)
-                        task.wait(0.5)
-                    end
-                end
+-- Auto Upgrade Coop: expand capacity/slots toward maxSlots when affordable
+local function runUpgradeCoop()
+    while getgenv().NX_HUB and flags.upgradeCoop do
+        local slots = coop().slots or 0
+        if slots < GC.maxSlots and CoopView.canExpand(slots) then
+            local cost = CoopView.expandCost(slots) or 0
+            if money() >= cost then
+                pcallInvoke(R.ExpandCoop)
+                task.wait(0.4)
             end
         end
-        task.wait(4.0)
+        task.wait(0.25)
     end
 end
 
--- Auto Claim Daily streak + session day
-local function runClaimDaily()
-    while getgenv().NX_HUB and flags.claimDaily do
-        local ok, daily = pcall(function() return client:get({"daily"}) end)
-        if ok and daily then
-            local claimed = daily.claimed or {}
-            -- streak day
-            if not claimed["day"] and not claimed["d"] then
-                pcallInvoke(R.DailyClaim, "day", nil)
-                task.wait(0.6)
-            end
-            -- session tiers (s1..s3)
-            local played = daily.played or 0
-            local session = daily.session or {}
-            for j, k in ipairs(session) do
-                if (not claimed["s" .. j]) and (k.at or 0) <= played then
-                    pcallInvoke(R.DailyClaim, "session", j)
-                    task.wait(0.6)
-                end
-            end
+-- Auto Upgrade Recycler: raise the recycler while affordable and unlocked
+local function runUpgradeRecycler()
+    while getgenv().NX_HUB and flags.upgradeRecycler do
+        local ok, scrap = pcall(function() return client:get({"scrap"}) end)
+        local level = (ok and scrap and scrap.recyclerLevel) or 0
+        local rbCount = rebirthCount()
+        local best = towerBest()
+        if RecyclerView.canUpgrade(level, rbCount)
+            and RecyclerView.floorUnlocked(level, best)
+            and money() >= (RecyclerView.upgradeCost(level) or 0) then
+            pcallInvoke(R.UpgradeRecycler)
+            task.wait(0.4)
         end
-        task.wait(5.0)
-    end
-end
-
--- Auto Claim Rebirth Milestones
-local function runClaimRebirth()
-    while getgenv().NX_HUB and flags.claimRebirth do
-        pcallInvoke(R.ClaimRebirthMilestones)
-        task.wait(6.0)
-    end
-end
-
--- Auto Claim Social / Community reward
-local function runClaimSocial()
-    while getgenv().NX_HUB and flags.claimSocial do
-        pcallInvoke(R.SocialClaim)
-        task.wait(10.0)
+        task.wait(0.25)
     end
 end
 
@@ -423,10 +371,8 @@ local function runAutoIncubator()
         end
 
         -- upgrade incubator level when affordable and rebirth is met
-        local okR, rebirth = pcall(function() return client:get({"rebirth"}) end)
-        local rbCount = (okR and type(rebirth) == "table" and rebirth.count) or 0
         local lvl = inc.level or 0
-        local can, need = IncubatorView.canUpgrade(lvl, rbCount)
+        local can = IncubatorView.canUpgrade(lvl, rebirthCount())
         if can and lvl < IncubatorView.maxLevel then
             local cost = IncubatorView.upgradeCost(lvl + 1) or 0
             if money() >= cost then
@@ -435,6 +381,84 @@ local function runAutoIncubator()
             end
         end
         task.wait(2.0)
+    end
+end
+
+-- Auto Claim Egg Incubator: claim ready incubated eggs only (no tenant/upgrade)
+local function runAutoClaimEggIncubator()
+    while getgenv().NX_HUB and flags.autoClaimEggIncubator do
+        if #(incubatorData().eggs or {}) > 0 then
+            pcallInvoke(R.IncubatorClaim)
+            task.wait(1.0)
+        end
+        task.wait(5.0)
+    end
+end
+
+-- Auto Upgrade Incubator: raise the incubator level (no claim / tenant)
+local function runAutoUpgradeIncubator()
+    while getgenv().NX_HUB and flags.autoUpgradeIncubator do
+        local lvl = incubatorData().level or 0
+        if IncubatorView.canUpgrade(lvl, rebirthCount()) and lvl < IncubatorView.maxLevel then
+            local cost = IncubatorView.upgradeCost(lvl + 1) or 0
+            if money() >= cost then
+                pcallInvoke(R.IncubatorUpgrade)
+                task.wait(0.4)
+            end
+        end
+        task.wait(0.25)
+    end
+end
+
+-- Auto Fuse Chickens: fuse two of the same typeId into a stronger one
+local function runAutoFuse()
+    while getgenv().NX_HUB and flags.autoFuse do
+        local list = chickenList()
+        local groups = {}
+        for _, c in ipairs(list) do
+            groups[c.typeId] = groups[c.typeId] or {}
+            table.insert(groups[c.typeId], c)
+        end
+        for typeId, grp in pairs(groups) do
+            if #grp >= 2 then
+                local a, b = grp[1], grp[2]
+                if a and b and a.id ~= b.id then
+                    -- field map selects each fusion trait from the higher-level parent (a)
+                    local fields = {}
+                    for _, g in ipairs(FusionRules.GENE_KEYS or {}) do
+                        table.insert(fields, { field = g, from = a.id })
+                    end
+                    pcallInvoke(R.FuseChickens, a.id, b.id, fields, nil, "a")
+                    task.wait(1.5)
+                end
+                break
+            end
+        end
+        task.wait(4.0)
+    end
+end
+
+-- Auto Sell / Dupe cleanup: keep one chicken per typeId, sell the rest
+local function runAutoSell()
+    while getgenv().NX_HUB and flags.autoSell do
+        local list = chickenList()
+        local activeId = roster().activeId
+        local seen = {}
+        local sell = {}
+        for _, c in ipairs(list) do
+            if c.id == activeId then
+                seen[c.typeId] = true
+            elseif seen[c.typeId] then
+                table.insert(sell, c.id)
+            else
+                seen[c.typeId] = true
+            end
+        end
+        if #sell > 0 then
+            pcallInvoke(R.SellChickens, sell)
+            task.wait(1.0)
+        end
+        task.wait(5.0)
     end
 end
 
@@ -452,15 +476,10 @@ local function runAutoArena()
             if #teamIds < teamSize and type(view.inventory) == "table" then
                 local sorted = {}
                 for _, c in ipairs(view.inventory) do
-                    if type(c) == "table" and c.id then
-                        table.insert(sorted, c)
-                    end
+                    if type(c) == "table" and c.id then table.insert(sorted, c) end
                 end
-                -- strongest first
                 table.sort(sorted, function(a, b)
-                    local ap = a.powerBig or 0
-                    local bp = b.powerBig or 0
-                    return ap > bp
+                    return (a.powerBig or 0) > (b.powerBig or 0)
                 end)
                 local ids = {}
                 for i = 1, math.min(teamSize, #sorted) do
@@ -488,15 +507,76 @@ local function runAutoArena()
     end
 end
 
--- Auto Rebirth setting: turn on the game's native auto-rebirth (needs the pass)
-local function runAutoRebirthSetting()
-    while getgenv().NX_HUB and flags.autoRebirthSetting do
-        local ok, reb = pcall(function() return client:get({"rebirth"}) end)
-        local auto = ok and type(reb) == "table" and reb.auto == true
-        if not auto then
-            pcallInvoke(R.SetAutoRebirth, true)
+------------------------------------------------------------------
+-- CLAIMS loop
+------------------------------------------------------------------
+
+local function missionStateData()
+    local ok2, missions = pcall(function() return client:get({"missions"}) end)
+    return {
+        roster = roster(),
+        towerBest = towerBest(),
+        rebirthCount = rebirthCount(),
+        recyclerLevel = 0,
+        missions = (ok2 and missions) or {},
+    }
+end
+
+-- Auto Claim Missions: claim every mission whose progress meets the target
+local function runClaimMissions()
+    while getgenv().NX_HUB and flags.claimMissions do
+        local md = missionStateData()
+        for _, scope in ipairs(MissionView.SCOPES) do
+            local act, aerr = pcall(MissionView.active, scope)
+            if type(act) == "table" then
+                for _, m in ipairs(act) do
+                    if m.kind == nil and MissionView.stateOf(md, m) == "ready" then
+                        pcallInvoke(R.MissionClaim, m.id)
+                        task.wait(0.5)
+                    end
+                end
+            end
         end
-        task.wait(8.0)
+        task.wait(4.0)
+    end
+end
+
+-- Auto Claim Daily: streak day + session tiers
+local function runClaimDaily()
+    while getgenv().NX_HUB and flags.claimDaily do
+        local ok, daily = pcall(function() return client:get({"daily"}) end)
+        if ok and daily then
+            local claimed = daily.claimed or {}
+            if not claimed["day"] and not claimed["d"] then
+                pcallInvoke(R.DailyClaim, "day", nil)
+                task.wait(0.6)
+            end
+            local played = daily.played or 0
+            local session = daily.session or {}
+            for j, k in ipairs(session) do
+                if (not claimed["s" .. j]) and (k.at or 0) <= played then
+                    pcallInvoke(R.DailyClaim, "session", j)
+                    task.wait(0.6)
+                end
+            end
+        end
+        task.wait(5.0)
+    end
+end
+
+-- Auto Claim Rebirth Milestones
+local function runClaimRebirth()
+    while getgenv().NX_HUB and flags.claimRebirth do
+        pcallInvoke(R.ClaimRebirthMilestones)
+        task.wait(6.0)
+    end
+end
+
+-- Auto Claim Social / Community reward
+local function runClaimSocial()
+    while getgenv().NX_HUB and flags.claimSocial do
+        pcallInvoke(R.SocialClaim)
+        task.wait(10.0)
     end
 end
 
@@ -505,50 +585,18 @@ local function runAutoClaimPass()
     while getgenv().NX_HUB and flags.autoClaimPass do
         local ok, purs = pcall(function() return client:get({"purchases"}) end)
         local passes = (ok and purs and purs.passes) or {}
-        -- iterate the claimed pass map to find unclaimed rungs; the server
-        -- rejects invalid/claimable-status calls harmlessly, so we attempt each
+        -- invalid statuses fail harmlessly; attempt each unclaimed numeric rung
         for tier, rungs in pairs(passes) do
             if type(rungs) == "table" then
                 for k, claimed in pairs(rungs) do
-                    if claimed == false or claimed == nil then
-                        if tonumber(k) then
-                            pcallInvoke(R.PassClaim, tonumber(k), tier)
-                            task.wait(0.8)
-                        end
+                    if (claimed == false or claimed == nil) and tonumber(k) then
+                        pcallInvoke(R.PassClaim, tonumber(k), tier)
+                        task.wait(0.8)
                     end
                 end
             end
         end
         task.wait(6.0)
-    end
-end
-
--- Auto Fuse Chickens: fuse duplicates of the same typeId into a stronger one
-local function runAutoFuse()
-    while getgenv().NX_HUB and flags.autoFuse do
-        local list = chickenList()
-        -- group by typeId, keep only groups with 2+
-        local groups = {}
-        for _, c in ipairs(list) do
-            groups[c.typeId] = groups[c.typeId] or {}
-            table.insert(groups[c.typeId], c)
-        end
-        for typeId, grp in pairs(groups) do
-            if #grp >= 2 then
-                local a, b = grp[1], grp[2]
-                if a and b and a.id ~= b.id then
-                    -- field map selects each fusion trait from the higher-level parent (a)
-                    local fields = {}
-                    for _, g in ipairs(FusionRules.GENE_KEYS or {}) do
-                        table.insert(fields, { field = g, from = a.id })
-                    end
-                    pcallInvoke(R.FuseChickens, a.id, b.id, fields, nil, "a")
-                    task.wait(1.5)
-                end
-                break
-            end
-        end
-        task.wait(4.0)
     end
 end
 
@@ -560,121 +608,8 @@ local function runAutoShopDust()
     end
 end
 
--- Auto Sell / Dupe cleanup: keep one chicken per typeId, sell the rest (low rarity first)
-local function runAutoSell()
-    while getgenv().NX_HUB and flags.autoSell do
-        local list = chickenList()
-        local activeId = roster().activeId
-        local seen = {}
-        local sell = {}
-        for _, c in ipairs(list) do
-            if c.id == activeId then
-                seen[c.typeId] = true
-            else
-                if seen[c.typeId] then
-                    table.insert(sell, c.id) -- duplicate -> sell
-                else
-                    seen[c.typeId] = true
-                end
-            end
-        end
-        if #sell > 0 then
-            pcallInvoke(R.SellChickens, sell)
-            task.wait(1.0)
-        end
-        task.wait(5.0)
-    end
-end
-
--- Auto Hot Egg: when you are the egg carrier, dodge meteors and fly to the safe zone
-local function runAutoHotEgg()
-    local meteors = {} -- {pos=Vector3, radius=number, hitAt=os.clock()+fall}
-    local conns = {}
-
-    -- telegrams are broadcast to all clients; we use them to dodge
-    local m = Remotes.onClient(R.HotEggMeteor, function(p)
-        if type(p) ~= "table" or typeof(p.at) ~= "Vector3" then return end
-        local fall = tonumber(p.fall) or 1.6
-        local radius = tonumber(p.radius) or 15
-        table.insert(meteors, {
-            pos = p.at,
-            radius = radius,
-            hitAt = os.clock() + fall,
-        })
-    end)
-    local prune = RunService.Heartbeat:Connect(function()
-        local now = os.clock()
-        for i = #meteors, 1, -1 do
-            if meteors[i].hitAt + 0.4 < now then
-                table.remove(meteors, i)
-            end
-        end
-    end)
-    table.insert(conns, m)
-    table.insert(conns, prune)
-
-    local carried = false -- was carrier on the previous pass
-    while getgenv().NX_HUB and flags.autoHotEgg do
-        local egg = workspace:FindFirstChild("HotEgg")
-        local hrp = getCharRoot()
-        if egg and egg:IsA("BasePart") and hrp then
-            local carrier = egg:GetAttribute("Carrier")
-            local isCarrier = type(carrier) == "number" and carrier == Player.UserId
-            local now = os.clock()
-
-            if isCarrier then
-                local pos = hrp.Position
-                -- dodge horizontally out of any meteor that is about to land near us
-                local move = Vector3.new(0, 0, 0)
-                for _, met in ipairs(meteors) do
-                    if met.hitAt > now and met.hitAt - now < 3 then
-                        local d = met.pos - pos
-                        local flat = Vector3.new(d.X, 0, d.Z)
-                        local len = flat.Magnitude
-                        local threat = met.radius + 2
-                        if len < threat then
-                            if len > 0.001 then
-                                move = move + (-flat / len) * (threat - len + 1)
-                            else
-                                move = move + Vector3.new(1, 0, 0) * (threat + 1)
-                            end
-                        end
-                    end
-                end
-                -- fly up just a LITTLE and only once when we first grab the egg, then stay.
-                -- no continuous climbing / holding - that looks like flying and can get kicked.
-                local hopY = 0
-                if not carried and pos.Y < 4 then
-                    hopY = math.min(6 - pos.Y, 6)
-                end
-                local newPos = pos + move + Vector3.new(0, hopY, 0)
-                local delta = newPos - pos
-                if delta.Magnitude > 0.3 then
-                    hrp.CFrame = hrp.CFrame + delta
-                end
-                carried = true
-            else
-                -- not carrying: close the distance to grab the egg (pickupRadius ~5)
-                local d = egg.Position - hrp.Position
-                d = Vector3.new(d.X, 0, d.Z)
-                local len = d.Magnitude
-                if len > 0.1 then
-                    hrp.CFrame = hrp.CFrame + (d / len) * 30
-                end
-                carried = false
-            end
-        end
-        task.wait()
-    end
-
-    for _, c in ipairs(conns) do
-        pcall(function() c:Disconnect() end)
-    end
-end
-
--- Auto Redeem Codes: automatically claim every known code currently available.
--- The server validates each attempt (invalid/used/expired just return an error), so
--- trying the full list is safe; only codes that actually grant a reward count.
+-- Auto Redeem Codes: claim every known code that is currently valid,
+-- plus any extra codes typed into the input box.
 local function runRedeem()
     local pool = {}
     local function refreshPool()
@@ -692,22 +627,37 @@ local function runRedeem()
             local code = pool[i]
             local ok, res = pcall(inv, R.RedeemCode, code)
             local state = ok and type(res) == "table" and res or { ok = false }
-            if state.ok then
-                redeemed[code] = true -- claimed successfully, don't retry
-            elseif state.error == "used" or state.error == "depleted" then
-                redeemed[code] = true -- already claimed before, don't retry
-            elseif state.error == "unknown" or state.error == "early" or state.error == "expired" then
-                redeemed[code] = true -- not claimable, don't retry
+            if state.ok
+                or state.error == "used"
+                or state.error == "depleted"
+                or state.error == "unknown"
+                or state.error == "early"
+                or state.error == "expired" then
+                redeemed[code] = true -- claimed or permanently unclaimable
             end
             task.wait(1.0)
-            -- stop if toggled off while redeeming
             if not (getgenv().NX_HUB and flags.autoRedeem) then break end
         end
-        -- refresh in case new codes become available
         refreshPool()
         task.wait(20.0)
     end
 end
+
+-- Auto Rebirth Setting: turn on the game's native auto-rebirth (needs the pass)
+local function runAutoRebirthSetting()
+    while getgenv().NX_HUB and flags.autoRebirthSetting do
+        local ok, reb = pcall(function() return client:get({"rebirth"}) end)
+        local auto = ok and type(reb) == "table" and reb.auto == true
+        if not auto then
+            pcallInvoke(R.SetAutoRebirth, true)
+        end
+        task.wait(8.0)
+    end
+end
+
+------------------------------------------------------------------
+-- MOVEMENT / UTILITY loops
+------------------------------------------------------------------
 
 -- Anti AFK: periodic movement
 local function runAntiAfk()
@@ -726,6 +676,44 @@ local function runAntiAfk()
     end
 end
 
+-- Auto Hot Egg: when Workspace.HotEgg appears while farming, stop tower
+-- temporarily, route the character to the egg (jumping the pit fence at
+-- the ring edge), and resume farming once the egg is grabbed or gone.
+local function runAutoHotEgg()
+    while getgenv().NX_HUB and flags.autoHotEgg do
+        local egg = workspace:FindFirstChild("HotEgg")
+        if egg and egg:IsA("BasePart") then
+            hotEggActive = true
+            local hrp = getCharRoot()
+            local hum = hrp and hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+            if hrp and hum then
+                local eggPos = egg.Position
+                local toEgg = eggPos - hrp.Position
+                local hDist = Vector3.new(toEgg.X, 0, toEgg.Z).Magnitude
+                local originDist = Vector3.new(hrp.Position.X, 0, hrp.Position.Z).Magnitude
+
+                if hDist > 5 then
+                    -- push the character horizontally toward the egg
+                    local bv = Instance.new("BodyVelocity")
+                    bv.MaxForce = Vector3.new(1e6, 0, 1e6)
+                    bv.Velocity = Vector3.new(toEgg.X, 0, toEgg.Z).Unit * 50
+                    bv.Parent = hrp
+                    -- jump over the pit fence when in the ring-edge zone
+                    if originDist > (PIT_RADIUS - 4) and originDist < (PIT_RADIUS + 4) then
+                        pcall(function() hum.Jump = true end)
+                    end
+                    task.wait(0.25)
+                    pcall(function() bv:Destroy() end)
+                end
+            end
+        else
+            if hotEggActive then hotEggActive = false end
+        end
+        task.wait(0.15)
+    end
+    hotEggActive = false
+end
+
 -- Performance Mode
 local function applyPerformance(on)
     pcall(function() RunService:Set3dRenderingEnabled(not on) end)
@@ -737,16 +725,9 @@ local function applyPerformance(on)
     end
 end
 
--- spawn/stop a loop helper
-local function toggleStart(name, fn, flag)
-    flag.value = not flag.value
-    getgenv().NX_HUB = true
-    if flag.value then
-        task.spawn(fn)
-    end
-end
-
--- build UI --------------------------------------------------------------
+------------------------------------------------------------------
+-- UI build
+------------------------------------------------------------------
 local win = Rayfield:CreateWindow({
     Name = "NEXUS HUB",
     Subtitle = "Grow a Chicken Fighter",
@@ -755,7 +736,7 @@ local win = Rayfield:CreateWindow({
     ConfigurationSaving = { Enabled = true, FolderName = "NexusHub", FileName = "settings" },
     Discord = { Enabled = false },
     KeySystem = false,
-    ToggleUIKeybind = Enum.KeyCode.RightAlt,
+    ToggleUIKeybind = Enum.KeyCode.LeftControl,
 })
 
 -- on reload, tear down the previous run's window so windows don't stack
@@ -765,178 +746,86 @@ if STATE then
     end)
 end
 
-local farm = win:CreateTab({ Name = "Farm", Icon = "home" })
-local misc = win:CreateTab({ Name = "Misc", Icon = "settings" })
-local eventsTab = win:CreateTab({ Name = "Events", Icon = "star" })
-local progTab = win:CreateTab({ Name = "Progression", Icon = "rocket" })
+-- toggle registration: { tab, section, name, flag, fn[, default] }
+local toggles = {
+    -- Farm
+    { "farm",   "Farming",    "Auto Upgrade Feeder",        "upgradeFeeder",          runUpgradeFeeder },
+    { "farm",   "Farming",    "Auto Buy Feeder",            "buyFeeder",              runBuyFeeder },
+    { "farm",   "Farming",    "Auto Send Tower",            "sendTower",              runSendTower },
+    { "farm",   "Farming",    "Auto Hatch Eggs",            "hatchEggs",              runHatchEggs },
+    { "farm",   "Farming",    "Auto Collect Eggs",          "collectEggs",            runCollectEggs },
+    { "farm",   "Farming",    "Auto Rebirth",               "rebirth",                runRebirth },
+    { "farm",   "Farming",    "Auto Upgrade Coop",          "upgradeCoop",            runUpgradeCoop },
+    { "farm",   "Farming",    "Auto Upgrade Recycler",      "upgradeRecycler",        runUpgradeRecycler },
+    { "farm",   "Farming",    "Auto Decline Tower Continue","declineTowerContinue",   runDeclineTowerContinue },
 
-farm:CreateSection({ Name = "Farming" })
+    -- Progression
+    { "prog",   "Progression","Auto Incubator",             "autoIncubator",          runAutoIncubator },
+    { "prog",   "Progression","Auto Claim Egg Incubator",   "autoClaimEggIncubator",  runAutoClaimEggIncubator },
+    { "prog",   "Progression","Auto Upgrade Incubator",     "autoUpgradeIncubator",   runAutoUpgradeIncubator },
+    { "prog",   "Progression","Auto Arena / Pit",           "autoArena",              runAutoArena },
+    { "prog",   "Progression","Auto Fuse Chickens",         "autoFuse",               runAutoFuse },
+    { "prog",   "Progression","Auto Sell Duplicates",       "autoSell",               runAutoSell },
 
-farm:CreateToggle({
-    Name = "Auto Upgrade Feeder",
-    Default = false,
-    Callback = function(v) flags.upgradeFeeder = v; if v then task.spawn(runUpgradeFeeder) end end,
-})
+    -- Events
+    { "events", "World Events","Auto Hot Egg (Jump Fence)", "autoHotEgg",             runAutoHotEgg },
 
-farm:CreateToggle({
-    Name = "Auto Buy Feeder",
-    Default = false,
-    Callback = function(v) flags.buyFeeder = v; if v then task.spawn(runBuyFeeder) end end,
-})
+    -- Misc / Claims
+    { "misc",   "Claims",     "Auto Claim Missions",        "claimMissions",          runClaimMissions },
+    { "misc",   "Claims",     "Auto Claim Daily",           "claimDaily",             runClaimDaily },
+    { "misc",   "Claims",     "Auto Claim Rebirth Milestones","claimRebirth",         runClaimRebirth },
+    { "misc",   "Claims",     "Auto Claim Social",          "claimSocial",            runClaimSocial },
 
-farm:CreateToggle({
-    Name = "Auto Send Tower",
-    Default = false,
-    Callback = function(v) flags.sendTower = v; if v then task.spawn(runSendTower) end end,
-})
+    -- Misc / Utility
+    { "misc",   "Utility",    "Anti AFK",                   "antiAfk",                runAntiAfk },
 
-farm:CreateToggle({
-    Name = "Auto Hatch Eggs",
-    Default = false,
-    Callback = function(v) flags.hatchEggs = v; if v then task.spawn(runHatchEggs) end end,
-})
+    -- Misc / Economy
+    { "misc",   "Economy",    "Auto Claim Pass",            "autoClaimPass",          runAutoClaimPass },
+    { "misc",   "Economy",    "Auto Rebirth Setting (native)","autoRebirthSetting",   runAutoRebirthSetting },
+    { "misc",   "Economy",    "Auto Claim Shop Dust",       "autoShopDust",           runAutoShopDust },
 
-farm:CreateToggle({
-    Name = "Auto Collect Eggs",
-    Default = false,
-    Callback = function(v) flags.collectEggs = v; if v then task.spawn(runCollectEggs) end end,
-})
+    -- Misc / Codes
+    { "misc",   "Codes",      "Auto Redeem All Codes",      "autoRedeem",             runRedeem },
+}
 
-farm:CreateToggle({
-    Name = "Auto Rebirth",
-    Default = false,
-    Callback = function(v) flags.rebirth = v; if v then task.spawn(runRebirth) end end,
-})
+local tabs = {
+    farm = win:CreateTab({ Name = "Farm", Icon = "home" }),
+    misc = win:CreateTab({ Name = "Misc", Icon = "settings" }),
+    events = win:CreateTab({ Name = "Events", Icon = "star" }),
+    prog = win:CreateTab({ Name = "Progression", Icon = "rocket" }),
+}
 
-farm:CreateToggle({
-    Name = "Auto Upgrade Coop",
-    Default = false,
-    Callback = function(v) flags.upgradeCoop = v; if v then task.spawn(runUpgradeCoop) end end,
-})
+local sections = {} -- tabKey -> sectionName -> section element (reused, created once)
+for _, t in ipairs(toggles) do
+    local tabKey, sectionName, name, flagKey, fn = t[1], t[2], t[3], t[4], t[5]
+    sections[tabKey] = sections[tabKey] or {}
+    if not sections[tabKey][sectionName] then
+        sections[tabKey][sectionName] = tabs[tabKey]:CreateSection({ Name = sectionName })
+    end
+    tabs[tabKey]:CreateToggle({
+        Name = name,
+        Default = false,
+        Callback = function(v)
+            flags[flagKey] = v
+            if v then task.spawn(fn) end
+        end,
+    })
+end
 
-farm:CreateToggle({
-    Name = "Auto Upgrade Recycler",
-    Default = false,
-    Callback = function(v) flags.upgradeRecycler = v; if v then task.spawn(runUpgradeRecycler) end end,
-})
-
-farm:CreateToggle({
-    Name = "Auto Decline Tower Continue",
-    Default = false,
-    Callback = function(v) flags.declineTowerContinue = v; if v then task.spawn(runDeclineTowerContinue) end end,
-})
-
--- Note: "Auto Open Gifts" is the daily reward claim -> see "Auto Claim Daily" below
-
-eventsTab:CreateSection({ Name = "Live Events" })
-
-eventsTab:CreateToggle({
-    Name = "Auto Hot Egg (dodge)",
-    Default = false,
-    Callback = function(v) flags.autoHotEgg = v; if v then task.spawn(runAutoHotEgg) end end,
-})
-
-misc:CreateSection({ Name = "Claims" })
-
-misc:CreateToggle({
-    Name = "Auto Claim Missions",
-    Default = false,
-    Callback = function(v) flags.claimMissions = v; if v then task.spawn(runClaimMissions) end end,
-})
-
-misc:CreateToggle({
-    Name = "Auto Claim Daily",
-    Default = false,
-    Callback = function(v) flags.claimDaily = v; if v then task.spawn(runClaimDaily) end end,
-})
-
-misc:CreateToggle({
-    Name = "Auto Claim Rebirth Milestones",
-    Default = false,
-    Callback = function(v) flags.claimRebirth = v; if v then task.spawn(runClaimRebirth) end end,
-})
-
-misc:CreateToggle({
-    Name = "Auto Claim Social",
-    Default = false,
-    Callback = function(v) flags.claimSocial = v; if v then task.spawn(runClaimSocial) end end,
-})
-
-progTab:CreateSection({ Name = "Progression" })
-
-progTab:CreateToggle({
-    Name = "Auto Incubator",
-    Default = false,
-    Callback = function(v) flags.autoIncubator = v; if v then task.spawn(runAutoIncubator) end end,
-})
-
-progTab:CreateToggle({
-    Name = "Auto Arena / Pit",
-    Default = false,
-    Callback = function(v) flags.autoArena = v; if v then task.spawn(runAutoArena) end end,
-})
-
-progTab:CreateToggle({
-    Name = "Auto Fuse Chickens",
-    Default = false,
-    Callback = function(v) flags.autoFuse = v; if v then task.spawn(runAutoFuse) end end,
-})
-
-progTab:CreateToggle({
-    Name = "Auto Sell Duplicates",
-    Default = false,
-    Callback = function(v) flags.autoSell = v; if v then task.spawn(runAutoSell) end end,
-})
-
-misc:CreateSection({ Name = "Utility" })
-
-misc:CreateToggle({
-    Name = "Anti AFK",
-    Default = false,
-    Callback = function(v) flags.antiAfk = v; if v then task.spawn(runAntiAfk) end end,
-})
-
-misc:CreateSection({ Name = "Economy" })
-
-misc:CreateToggle({
-    Name = "Auto Claim Pass",
-    Default = false,
-    Callback = function(v) flags.autoClaimPass = v; if v then task.spawn(runAutoClaimPass) end end,
-})
-
-misc:CreateToggle({
-    Name = "Auto Rebirth Setting (native)",
-    Default = false,
-    Callback = function(v) flags.autoRebirthSetting = v; if v then task.spawn(runAutoRebirthSetting) end end,
-})
-
-misc:CreateToggle({
-    Name = "Auto Claim Shop Dust",
-    Default = false,
-    Callback = function(v) flags.autoShopDust = v; if v then task.spawn(runAutoShopDust) end end,
-})
-
-misc:CreateSection({ Name = "Codes" })
-
-misc:CreateToggle({
-    Name = "Auto Redeem All Codes",
-    Default = false,
-    Callback = function(v) flags.autoRedeem = v; if v then task.spawn(runRedeem) end end,
-})
-
-misc:CreateInput({
+-- Misc / Codes input box (not a toggle)
+tabs.misc:CreateInput({
     Name = "Extra Code",
     PlaceholderText = "optional extra code",
     RemoveTextAfterFocusLost = true,
     Callback = function(v)
         if v and v ~= "" then
-            local code = string.gsub(string.upper(v), "%s+", "")
-            table.insert(codes, code)
+            table.insert(codes, string.gsub(string.upper(v), "%s+", ""))
         end
     end,
 })
 
-misc:CreateToggle({
+-- Performance Mode toggle (immediate, not a loop)
+tabs.misc:CreateToggle({
     Name = "Performance Mode",
     Default = false,
     Callback = function(v) flags.performance = v; applyPerformance(v) end,
