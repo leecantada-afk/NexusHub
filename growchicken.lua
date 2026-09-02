@@ -3,6 +3,14 @@
      Organized: helpers -> loops (by category) -> UI build
      ============================================================ ]]
 
+-- Per-generation token: every load bumps it, and each loop captures
+-- its own gen at spawn. An old instance's loops die the instant a
+-- newer one loads, because they gate on gen == getgenv().NEXUS_GEN.
+-- This prevents stale loop threads from a destroyed window from
+-- keeping a toggle "on" (e.g. auto-upgrading the coop) after reload.
+getgenv().NEXUS_GEN = (getgenv().NEXUS_GEN or 0) + 1
+local gen = getgenv().NEXUS_GEN
+
 ------------------------------------------------------------------
 -- Services & requires
 ------------------------------------------------------------------
@@ -24,6 +32,9 @@ local RecyclerView = require(ReplicatedStorage.Features.Scrap.RecyclerView)
 local IncubatorView = require(ReplicatedStorage.Features.Incubator.IncubatorView)
 local FusionRules = require(ReplicatedStorage.Features.Chicken.FusionRules)
 local ChickenMode = require(Player.PlayerScripts.Features.Chicken.ChickenMode)
+local RebirthBonus = require(ReplicatedStorage.Core.Progression.RebirthBonus)
+local RebirthExperiment = require(ReplicatedStorage.Core.Progression.RebirthExperiment)
+local Ladder = require(ReplicatedStorage.Features.Battle.campaign.Ladder)
 
 -- Rayfield is shared globally so re-runs don't stack windows
 local Rayfield = getgenv().NexusRayfield
@@ -36,6 +47,11 @@ local inv = Remotes.invoke
 local R = Remotes.defs
 local GC = GameConfig.generators
 
+-- True for the CURRENT instance only; stale instances fail this.
+local function hubAlive()
+    return getgenv().NX_HUB == true and gen == getgenv().NEXUS_GEN
+end
+
 ------------------------------------------------------------------
 -- Config
 ------------------------------------------------------------------
@@ -46,7 +62,8 @@ local flags = {
     hatchEggs = false,
     collectEggs = false,
     rebirth = false,
-    declineTowerContinue = false,
+    -- tower strategy: "frontier" | "warmup" | "bottom"
+    towerStrategy = "frontier",
     upgradeCoop = false,
     upgradeRecycler = false,
     autoIncubator = false,
@@ -59,19 +76,14 @@ local flags = {
     claimDaily = false,
     claimRebirth = false,
     claimSocial = false,
+    autoPet = false,
     autoClaimPass = false,
-    autoRebirthSetting = false,
     autoShopDust = false,
     autoRedeem = false,
     antiAfk = false,
-    autoHotEgg = false,
     performance = false,
+    autoLoadOnTeleport = false,
 }
-
--- Global hot egg state — set while egg is live so runSendTower pauses
-local hotEggActive = false
-
-local PIT_RADIUS = 40
 
 -- Current known-good codes (server validates each; only valid, unredeemed grant rewards)
 local knownCodes = {
@@ -159,13 +171,113 @@ local function atCorral()
     return ChickenMode.order() == "coop" and ChickenMode.where() == "corral"
 end
 
+-- True when the tower best has already met this player's rebirth
+-- requirement floor. Rebirth also needs the chicken AT the corral, so
+-- while this is true we hold the chicken home instead of re-sending it
+-- to the tower, letting it rest at the corral for the rebirth to fire.
+local function rebirthReady()
+    local ok, count = pcall(function() return rebirthCount() end)
+    local arm = (pcall(function() return RebirthExperiment.armOf(Player) end)
+        and RebirthExperiment.armOf(Player)) or "control"
+    local floor = RebirthBonus.requirementFloorFor(count or 0, arm == RebirthExperiment.VARIANT)
+    return towerBest() >= floor
+end
+
+------------------------------------------------------------------
+-- SERVER hops
+------------------------------------------------------------------
+
+-- Fetch the public server list for this place via the Roblox games API.
+-- Returns an array of { id=jobId, playing=players, max=maxPlayers, ping }.
+local function fetchServers()
+    local list = {}
+    local ok, res = pcall(function()
+        return request({
+            Url = "https://games.roblox.com/v1/games/" .. game.PlaceId
+                .. "/servers/Public?limit=100&sortOrder=Desc",
+            Method = "GET",
+        })
+    end)
+    if not ok or type(res) ~= "table" or type(res.Body) ~= "string" then
+        return list
+    end
+    local ok2, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(res.Body)
+    end)
+    if not ok2 or type(data) ~= "table" then return list end
+    for _, s in ipairs(data.data or {}) do
+        if type(s) == "table" and type(s.id) == "string" then
+            table.insert(list, {
+                id = s.id,
+                playing = tonumber(s.playing) or 0,
+                max = tonumber(s.maxPlayers) or 0,
+                ping = tonumber(s.ping) or 0,
+            })
+        end
+    end
+    return list
+end
+
+-- Queue the hub to re-load itself in the new server when Auto Load on
+-- Teleport is enabled. Reads the canonical source from the workspace copy.
+local function queueHubReload()
+    if not flags.autoLoadOnTeleport then return end
+    local ok, src = pcall(readfile, "nexus_hub_reload.luau")
+    if ok and type(src) == "string" then
+        pcall(queue_on_teleport, "loadstring(readfile('nexus_hub_reload.luau'))()")
+    end
+end
+
+-- Teleport to a specific server (jobId). Same-place hop within this game.
+local function hopToJob(jobId)
+    if not jobId or jobId == "" then return false end
+    queueHubReload()
+    local TeleportService = game:GetService("TeleportService")
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId)
+    end)
+    return ok, err
+end
+
+-- Server Hop: teleport to a random server that is not this one.
+local function serverHop()
+    local servers = fetchServers()
+    local others = {}
+    for _, s in ipairs(servers) do
+        if s.id ~= game.JobId then table.insert(others, s.id) end
+    end
+    if #others == 0 then return false, "no other servers found" end
+    local job = others[math.random(1, #others)]
+    return hopToJob(job)
+end
+
+-- Server Hop Low Players: teleport to the server with the fewest players.
+local function serverHopLow()
+    local servers = fetchServers()
+    local best
+    for _, s in ipairs(servers) do
+        if s.id ~= game.JobId then
+            if not best or s.playing < best.playing then
+                best = s
+            end
+        end
+    end
+    if not best then return false, "no other servers found" end
+    return hopToJob(best.id)
+end
+
+-- Rejoin: teleport back into the very same server you are on.
+local function rejoin()
+    return hopToJob(game.JobId)
+end
+
 ------------------------------------------------------------------
 -- FARM loops
 ------------------------------------------------------------------
 
 -- Auto Upgrade Feeder: raise every generator toward maxLevel, cheapest first
 local function runUpgradeFeeder()
-    while getgenv().NX_HUB and flags.upgradeFeeder do
+    while hubAlive() and flags.upgradeFeeder do
         local c = coop()
         local gens = c.generators or {}
         local bestSlot, bestCost = nil, nil
@@ -186,7 +298,7 @@ end
 
 -- Auto Buy Feeder: fill slots, expanding the coop when a new slot is needed
 local function runBuyFeeder()
-    while getgenv().NX_HUB and flags.buyFeeder do
+    while hubAlive() and flags.buyFeeder do
         local c = coop()
         local gens = c.generators or {}
         local slots = c.slots or #gens
@@ -209,21 +321,54 @@ local function runBuyFeeder()
     end
 end
 
--- Auto Send Tower: send when idle (full health) — but not while a hot egg is live
+-- Tower start-floor helper. The three Auto Farm tower strategies pick which
+-- floor the run begins at:
+--   "bottom"   -> start from floor 1 (full fresh run)
+--   "frontier" -> start at your current best (frontier)
+--   "warmup"   -> start a few floors below the frontier to build up power
+local TOWER_WARMUP_OFFSET = 5
+local function towerStartFloor()
+    local front = Ladder.frontier(towerBest())
+    local s = flags.towerStrategy or "frontier"
+    if s == "bottom" then
+        return 1
+    elseif s == "warmup" then
+        return math.max(1, front - TOWER_WARMUP_OFFSET)
+    else
+        return front
+    end
+end
+
+-- Auto Send Tower: send when idle (full health) — but not while a hot egg
+-- is live, and not when the rebirth requirement is already met (we hold the
+-- chicken at the corral so the rebirth loop can fire it). Starts the run at
+-- the floor chosen by the tower strategy, and always declines the "continue"
+-- offer so a failed run ends instead of paying to keep going.
+local continueConn = nil
 local function runSendTower()
-    while getgenv().NX_HUB and flags.sendTower do
+    -- decline the tower continue offer whenever auto-farm is on
+    if not continueConn then
+        continueConn = Remotes.onClient(R.TowerContinueOffer, function()
+            task.spawn(function() pcall(Remotes.fire, R.TowerContinueDecline) end)
+        end)
+    end
+    while hubAlive() and flags.sendTower do
         local v = vitals()
-        if (v.health or 1) >= 0.999 and not hotEggActive then
-            task.spawn(function() pcallInvoke(R.TowerStart) end)
+        if (v.health or 1) >= 0.999 and not rebirthReady() then
+            task.spawn(function() pcallInvoke(R.TowerStart, towerStartFloor()) end)
             task.wait(2.5)
         end
         task.wait(0.7)
+    end
+    if continueConn then
+        pcall(function() continueConn:Disconnect() end)
+        continueConn = nil
     end
 end
 
 -- Auto Hatch Eggs: hatch every egg in inventory
 local function runHatchEggs()
-    while getgenv().NX_HUB and flags.hatchEggs do
+    while hubAlive() and flags.hatchEggs do
         local r = roster()
         if r.eggs then
             for eggId, count in pairs(r.eggs) do
@@ -239,10 +384,10 @@ end
 
 -- Auto Collect Eggs: only collect YOUR OWN chicken's eggs laid inside your coop
 local function runCollectEggs()
-    while getgenv().NX_HUB and flags.collectEggs do
+    while hubAlive() and flags.collectEggs do
         local eggs = CollectionService:GetTagged("NestEgg")
         for _, egg in ipairs(eggs) do
-            if not getgenv().NX_HUB or not flags.collectEggs then break end
+            if not hubAlive() or not flags.collectEggs then break end
             if egg:GetAttribute("owner") ~= Player.UserId then continue end
             local hrp = getCharRoot()
             if hrp and egg:IsA("BasePart") then
@@ -275,7 +420,7 @@ end
 
 -- Auto Rebirth: rebuild when idle, at full health, and resting at the corral
 local function runRebirth()
-    while getgenv().NX_HUB and flags.rebirth do
+    while hubAlive() and flags.rebirth do
         local v = vitals()
         if atCorral() and towerBest() >= 1 and (v.health or 1) >= 0.999 then
             pcallInvoke(R.Rebirth)
@@ -285,32 +430,13 @@ local function runRebirth()
     end
 end
 
--- Auto Decline Tower Continue: hit "no thanks" when the continue offer appears
-local continueConn = nil
-local function runDeclineTowerContinue()
-    while getgenv().NX_HUB and flags.declineTowerContinue do
-        if not continueConn then
-            continueConn = Remotes.onClient(R.TowerContinueOffer, function()
-                task.spawn(function()
-                    pcall(Remotes.fire, R.TowerContinueDecline)
-                end)
-            end)
-        end
-        task.wait(1)
-    end
-    if continueConn then
-        pcall(function() continueConn:Disconnect() end)
-        continueConn = nil
-    end
-end
-
 ------------------------------------------------------------------
 -- PROGRESSION loops
 ------------------------------------------------------------------
 
 -- Auto Upgrade Coop: expand capacity/slots toward maxSlots when affordable
 local function runUpgradeCoop()
-    while getgenv().NX_HUB and flags.upgradeCoop do
+    while hubAlive() and flags.upgradeCoop do
         local slots = coop().slots or 0
         if slots < GC.maxSlots and CoopView.canExpand(slots) then
             local cost = CoopView.expandCost(slots) or 0
@@ -325,7 +451,7 @@ end
 
 -- Auto Upgrade Recycler: raise the recycler while affordable and unlocked
 local function runUpgradeRecycler()
-    while getgenv().NX_HUB and flags.upgradeRecycler do
+    while hubAlive() and flags.upgradeRecycler do
         local ok, scrap = pcall(function() return client:get({"scrap"}) end)
         local level = (ok and scrap and scrap.recyclerLevel) or 0
         local rbCount = rebirthCount()
@@ -343,7 +469,7 @@ end
 -- Auto Incubator: claim hatched eggs, incubate your best chicken, upgrade level
 local function runAutoIncubator()
     local lastInserted = nil
-    while getgenv().NX_HUB and flags.autoIncubator do
+    while hubAlive() and flags.autoIncubator do
         local inc = incubatorData()
         local eggs = inc.eggs or {}
 
@@ -386,7 +512,7 @@ end
 
 -- Auto Claim Egg Incubator: claim ready incubated eggs only (no tenant/upgrade)
 local function runAutoClaimEggIncubator()
-    while getgenv().NX_HUB and flags.autoClaimEggIncubator do
+    while hubAlive() and flags.autoClaimEggIncubator do
         if #(incubatorData().eggs or {}) > 0 then
             pcallInvoke(R.IncubatorClaim)
             task.wait(1.0)
@@ -397,7 +523,7 @@ end
 
 -- Auto Upgrade Incubator: raise the incubator level (no claim / tenant)
 local function runAutoUpgradeIncubator()
-    while getgenv().NX_HUB and flags.autoUpgradeIncubator do
+    while hubAlive() and flags.autoUpgradeIncubator do
         local lvl = incubatorData().level or 0
         if IncubatorView.canUpgrade(lvl, rebirthCount()) and lvl < IncubatorView.maxLevel then
             local cost = IncubatorView.upgradeCost(lvl + 1) or 0
@@ -412,7 +538,7 @@ end
 
 -- Auto Fuse Chickens: fuse two of the same typeId into a stronger one
 local function runAutoFuse()
-    while getgenv().NX_HUB and flags.autoFuse do
+    while hubAlive() and flags.autoFuse do
         local list = chickenList()
         local groups = {}
         for _, c in ipairs(list) do
@@ -440,7 +566,7 @@ end
 
 -- Auto Sell / Dupe cleanup: keep one chicken per typeId, sell the rest
 local function runAutoSell()
-    while getgenv().NX_HUB and flags.autoSell do
+    while hubAlive() and flags.autoSell do
         local list = chickenList()
         local activeId = roster().activeId
         local seen = {}
@@ -464,7 +590,7 @@ end
 
 -- Auto Arena / Pit: ensure a team, fight when available, claim rank rewards
 local function runAutoArena()
-    while getgenv().NX_HUB and flags.autoArena do
+    while hubAlive() and flags.autoArena do
         local ok, view = pcall(function()
             local data = inv(R.ArenaGetView)
             return data and data.data, data
@@ -524,7 +650,7 @@ end
 
 -- Auto Claim Missions: claim every mission whose progress meets the target
 local function runClaimMissions()
-    while getgenv().NX_HUB and flags.claimMissions do
+    while hubAlive() and flags.claimMissions do
         local md = missionStateData()
         for _, scope in ipairs(MissionView.SCOPES) do
             local act, aerr = pcall(MissionView.active, scope)
@@ -543,7 +669,7 @@ end
 
 -- Auto Claim Daily: streak day + session tiers
 local function runClaimDaily()
-    while getgenv().NX_HUB and flags.claimDaily do
+    while hubAlive() and flags.claimDaily do
         local ok, daily = pcall(function() return client:get({"daily"}) end)
         if ok and daily then
             local claimed = daily.claimed or {}
@@ -566,7 +692,7 @@ end
 
 -- Auto Claim Rebirth Milestones
 local function runClaimRebirth()
-    while getgenv().NX_HUB and flags.claimRebirth do
+    while hubAlive() and flags.claimRebirth do
         pcallInvoke(R.ClaimRebirthMilestones)
         task.wait(6.0)
     end
@@ -574,7 +700,7 @@ end
 
 -- Auto Claim Social / Community reward
 local function runClaimSocial()
-    while getgenv().NX_HUB and flags.claimSocial do
+    while hubAlive() and flags.claimSocial do
         pcallInvoke(R.SocialClaim)
         task.wait(10.0)
     end
@@ -582,7 +708,7 @@ end
 
 -- Auto Claim Pass: claim every claimable pass rung
 local function runAutoClaimPass()
-    while getgenv().NX_HUB and flags.autoClaimPass do
+    while hubAlive() and flags.autoClaimPass do
         local ok, purs = pcall(function() return client:get({"purchases"}) end)
         local passes = (ok and purs and purs.passes) or {}
         -- invalid statuses fail harmlessly; attempt each unclaimed numeric rung
@@ -602,7 +728,7 @@ end
 
 -- Auto Claim Shop Dust: claim the daily shop dust reward
 local function runAutoShopDust()
-    while getgenv().NX_HUB and flags.autoShopDust do
+    while hubAlive() and flags.autoShopDust do
         pcallInvoke(R.ClaimShopDust)
         task.wait(15.0)
     end
@@ -622,7 +748,7 @@ local function runRedeem()
         end
     end
     refreshPool()
-    while getgenv().NX_HUB and flags.autoRedeem do
+    while hubAlive() and flags.autoRedeem do
         for i = #pool, 1, -1 do
             local code = pool[i]
             local ok, res = pcall(inv, R.RedeemCode, code)
@@ -636,22 +762,10 @@ local function runRedeem()
                 redeemed[code] = true -- claimed or permanently unclaimable
             end
             task.wait(1.0)
-            if not (getgenv().NX_HUB and flags.autoRedeem) then break end
+            if not (hubAlive() and flags.autoRedeem) then break end
         end
         refreshPool()
         task.wait(20.0)
-    end
-end
-
--- Auto Rebirth Setting: turn on the game's native auto-rebirth (needs the pass)
-local function runAutoRebirthSetting()
-    while getgenv().NX_HUB and flags.autoRebirthSetting do
-        local ok, reb = pcall(function() return client:get({"rebirth"}) end)
-        local auto = ok and type(reb) == "table" and reb.auto == true
-        if not auto then
-            pcallInvoke(R.SetAutoRebirth, true)
-        end
-        task.wait(8.0)
     end
 end
 
@@ -662,7 +776,7 @@ end
 -- Anti AFK: periodic movement
 local function runAntiAfk()
     local last = 0
-    while getgenv().NX_HUB and flags.antiAfk do
+    while hubAlive() and flags.antiAfk do
         local now = tick()
         if now - last >= 60 then
             last = now
@@ -676,42 +790,17 @@ local function runAntiAfk()
     end
 end
 
--- Auto Hot Egg: when Workspace.HotEgg appears while farming, stop tower
--- temporarily, route the character to the egg (jumping the pit fence at
--- the ring edge), and resume farming once the egg is grabbed or gone.
-local function runAutoHotEgg()
-    while getgenv().NX_HUB and flags.autoHotEgg do
-        local egg = workspace:FindFirstChild("HotEgg")
-        if egg and egg:IsA("BasePart") then
-            hotEggActive = true
-            local hrp = getCharRoot()
-            local hum = hrp and hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
-            if hrp and hum then
-                local eggPos = egg.Position
-                local toEgg = eggPos - hrp.Position
-                local hDist = Vector3.new(toEgg.X, 0, toEgg.Z).Magnitude
-                local originDist = Vector3.new(hrp.Position.X, 0, hrp.Position.Z).Magnitude
-
-                if hDist > 5 then
-                    -- push the character horizontally toward the egg
-                    local bv = Instance.new("BodyVelocity")
-                    bv.MaxForce = Vector3.new(1e6, 0, 1e6)
-                    bv.Velocity = Vector3.new(toEgg.X, 0, toEgg.Z).Unit * 50
-                    bv.Parent = hrp
-                    -- jump over the pit fence when in the ring-edge zone
-                    if originDist > (PIT_RADIUS - 4) and originDist < (PIT_RADIUS + 4) then
-                        pcall(function() hum.Jump = true end)
-                    end
-                    task.wait(0.25)
-                    pcall(function() bv:Destroy() end)
-                end
-            end
-        else
-            if hotEggActive then hotEggActive = false end
+-- Auto Pet: repeatedly pet your chicken while it rests at the coop, building
+-- the pet combo (comboWindow 2.2s, minInterval 0.26s) so the combo milestones
+-- (up to several thousand per pet) keep paying out. Only fires when the
+-- chicken is home (order "coop"); the server rejects pets mid-pit/campaign.
+local function runAutoPet()
+    while hubAlive() and flags.autoPet do
+        if ChickenMode.order() == "coop" then
+            pcall(Remotes.fire, R.PetChicken)
         end
-        task.wait(0.15)
+        task.wait(0.35)
     end
-    hotEggActive = false
 end
 
 -- Performance Mode
@@ -757,7 +846,6 @@ local toggles = {
     { "farm",   "Farming",    "Auto Rebirth",               "rebirth",                runRebirth },
     { "farm",   "Farming",    "Auto Upgrade Coop",          "upgradeCoop",            runUpgradeCoop },
     { "farm",   "Farming",    "Auto Upgrade Recycler",      "upgradeRecycler",        runUpgradeRecycler },
-    { "farm",   "Farming",    "Auto Decline Tower Continue","declineTowerContinue",   runDeclineTowerContinue },
 
     -- Progression
     { "prog",   "Progression","Auto Incubator",             "autoIncubator",          runAutoIncubator },
@@ -767,9 +855,6 @@ local toggles = {
     { "prog",   "Progression","Auto Fuse Chickens",         "autoFuse",               runAutoFuse },
     { "prog",   "Progression","Auto Sell Duplicates",       "autoSell",               runAutoSell },
 
-    -- Events
-    { "events", "World Events","Auto Hot Egg (Jump Fence)", "autoHotEgg",             runAutoHotEgg },
-
     -- Misc / Claims
     { "misc",   "Claims",     "Auto Claim Missions",        "claimMissions",          runClaimMissions },
     { "misc",   "Claims",     "Auto Claim Daily",           "claimDaily",             runClaimDaily },
@@ -778,10 +863,10 @@ local toggles = {
 
     -- Misc / Utility
     { "misc",   "Utility",    "Anti AFK",                   "antiAfk",                runAntiAfk },
+    { "misc",   "Utility",    "Auto Pet",                   "autoPet",                runAutoPet },
 
     -- Misc / Economy
     { "misc",   "Economy",    "Auto Claim Pass",            "autoClaimPass",          runAutoClaimPass },
-    { "misc",   "Economy",    "Auto Rebirth Setting (native)","autoRebirthSetting",   runAutoRebirthSetting },
     { "misc",   "Economy",    "Auto Claim Shop Dust",       "autoShopDust",           runAutoShopDust },
 
     -- Misc / Codes
@@ -791,8 +876,8 @@ local toggles = {
 local tabs = {
     farm = win:CreateTab({ Name = "Farm", Icon = "home" }),
     misc = win:CreateTab({ Name = "Misc", Icon = "settings" }),
-    events = win:CreateTab({ Name = "Events", Icon = "star" }),
     prog = win:CreateTab({ Name = "Progression", Icon = "rocket" }),
+    server = win:CreateTab({ Name = "Server", Icon = "globe" }),
 }
 
 local sections = {} -- tabKey -> sectionName -> section element (reused, created once)
@@ -812,6 +897,29 @@ for _, t in ipairs(toggles) do
     })
 end
 
+-- Auto Farm tower start strategy (Auto Send Tower uses this to pick the floor)
+local strategyOptions = {
+    "Straight To Your Frontier",
+    "Warm Up At Floor",
+    "Start From The Bottom",
+}
+tabs.farm:CreateDropdown({
+    Name = "Tower Strategy",
+    Options = strategyOptions,
+    CurrentOption = { "Straight To Your Frontier" },
+    MultipleOptions = false,
+    Callback = function(opts)
+        local picked = (type(opts) == "table" and opts[1]) or opts
+        if picked == "Warm Up At Floor" then
+            flags.towerStrategy = "warmup"
+        elseif picked == "Start From The Bottom" then
+            flags.towerStrategy = "bottom"
+        else
+            flags.towerStrategy = "frontier"
+        end
+    end,
+})
+
 -- Misc / Codes input box (not a toggle)
 tabs.misc:CreateInput({
     Name = "Extra Code",
@@ -829,6 +937,32 @@ tabs.misc:CreateToggle({
     Name = "Performance Mode",
     Default = false,
     Callback = function(v) flags.performance = v; applyPerformance(v) end,
+})
+
+-- Server tab: same-place server hopping + rejoin
+local serverSection = tabs.server:CreateSection({ Name = "Server" })
+tabs.server:CreateButton({
+    Name = "Server Hop",
+    Callback = function()
+        serverHop()
+    end,
+})
+tabs.server:CreateButton({
+    Name = "Server Hop Low Players",
+    Callback = function()
+        serverHopLow()
+    end,
+})
+tabs.server:CreateButton({
+    Name = "Rejoin",
+    Callback = function()
+        rejoin()
+    end,
+})
+tabs.server:CreateToggle({
+    Name = "Auto Load on Teleport",
+    Default = false,
+    Callback = function(v) flags.autoLoadOnTeleport = v end,
 })
 
 getgenv().NX_HUB = true
