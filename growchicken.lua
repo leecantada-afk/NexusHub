@@ -939,6 +939,20 @@ tabs.misc:CreateToggle({
     Callback = function(v) flags.performance = v; applyPerformance(v) end,
 })
 
+-- Misc / Hub: unload everything
+tabs.misc:CreateSection({ Name = "Hub" })
+tabs.misc:CreateButton({
+    Name = "Unload Nexus Hub",
+    Callback = function()
+        -- kill every loop (hubAlive gates on this) and reset all flags
+        getgenv().NX_HUB = false
+        for k in pairs(flags) do flags[k] = false end
+        -- destroy the GUI
+        pcall(function() if win then win:Unload() end end)
+        getgenv().NX_HUB = nil
+    end,
+})
+
 -- Server tab: same-place server hopping + rejoin
 local serverSection = tabs.server:CreateSection({ Name = "Server" })
 tabs.server:CreateButton({
