@@ -59,6 +59,7 @@ local flags = {
     sendTower = false,
     hatchEggs = false,
     rebirth = false,
+    rebirthFarm = false, -- beta: one toggle = auto tower + 2-farm upgrade + retreat-rebirth
     -- tower strategy: "frontier" | "warmup" | "bottom"
     towerStrategy = "frontier",
     upgradeCoop = false,
@@ -557,6 +558,61 @@ local function runRebirth()
     end
 end
 
+-- Rebirth Farm (beta). ONE toggle drives the whole rebirth grind loop:
+--   * Auto farm tower   -> send the rooster to the strategy floor, refarm
+--   * Upgrade 2 farms   -> raise the first TWO generators only; never buys a
+--                          new farm and never expands/upgrades the coop
+--   * Retreat / rebirth -> once the rebirth threshold is met, surrender any
+--                          running tower, return to the corral and fire rebirth
+-- It shares the tower continue-decline connection so failed full runs settle
+-- instead of paying to keep going. Everything gates on the single flag.
+local rfContinueConn = nil
+local function runRebirthFarm()
+    if not rfContinueConn then
+        rfContinueConn = Remotes.onClient(R.TowerContinueOffer, function()
+            task.spawn(function() pcall(Remotes.fire, R.TowerContinueDecline) end)
+        end)
+    end
+    while hubAlive() and flags.rebirthFarm do
+        -- 1) retreat + rebirth once the threshold is met
+        if rebirthReady() and not atCorral() then
+            pcallInvoke(R.TowerSurrender)
+            task.wait(1.0)
+        end
+        local v = vitals()
+        if rebirthReady() and atCorral() and towerBest() >= 1 and (v.health or 1) >= 0.999 then
+            pcallInvoke(R.Rebirth)
+            task.wait(3)
+        end
+        -- 2) auto farm tower (never when rebirth is about to fire)
+        if not rebirthReady() and (vitals().health or 1) >= 0.999 then
+            task.spawn(function() pcallInvoke(R.TowerStart, towerStartFloor()) end)
+            task.wait(2.5)
+        end
+        -- 3) upgrade only the first two farms (cheapest of the two), never buy
+        local c = coop()
+        local gens = c.generators or {}
+        local bestSlot, bestCost = nil, nil
+        for i = 1, math.min(2, #gens) do
+            local g = gens[i]
+            if g and g.level and g.level < GC.maxLevel then
+                local cost = math.floor(GC.upgradeCost.base * (GC.upgradeCost.growth ^ math.max(0, g.level - 1)))
+                if bestSlot == nil or cost < bestCost then
+                    bestCost, bestSlot = cost, g.slot
+                end
+            end
+        end
+        if bestSlot and money() >= (bestCost or 0) then
+            pcallInvoke(R.UpgradeGenerator, bestSlot)
+        end
+        task.wait(0.7)
+    end
+    if rfContinueConn then
+        pcall(function() rfContinueConn:Disconnect() end)
+        rfContinueConn = nil
+    end
+end
+
 ------------------------------------------------------------------
 -- PROGRESSION loops
 ------------------------------------------------------------------
@@ -965,6 +1021,9 @@ end
 
 -- toggle registration: { tab, section, name, flag, fn[, default] }
 local toggles = {
+    -- Rebirth farm (beta): one toggle controls tower farm + 2-farm upgrade + retreat-rebirth
+    { "rfarm",  "Rebirth Farm","Auto Rebirth Farm",          "rebirthFarm",            runRebirthFarm },
+
     -- Farm
     { "farm",   "Farming",    "Auto Upgrade Feeder",        "upgradeFeeder",          runUpgradeFeeder },
     { "farm",   "Farming",    "Auto Buy Feeder",            "buyFeeder",              runBuyFeeder },
@@ -1002,6 +1061,7 @@ local toggles = {
 }
 
 local tabs = {
+    rfarm = win:CreateTab({ Name = "Rebirth farm", Icon = "flame" }),
     farm = win:CreateTab({ Name = "Farm", Icon = "home" }),
     misc = win:CreateTab({ Name = "Misc", Icon = "settings" }),
     prog = win:CreateTab({ Name = "Progression", Icon = "rocket" }),
