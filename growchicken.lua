@@ -295,6 +295,34 @@ end
 -- FARM loops
 ------------------------------------------------------------------
 
+-- The four Farm actions that spend money on the coop (upgrade feeder, buy
+-- feeder, upgrade coop) all read the same cached coop()/money() data and fire
+-- coop remotes. If two of them act in the same instant they race on stale
+-- state and double-spend, which is what made "Auto Upgrade Feeder" look like
+-- it also triggered the coop upgrade. A single shared lock lets only one of
+-- them fire at a time, so they can never interfere.
+local farmLocked = false
+local function withFarmLock(fn)
+    if farmLocked then return end
+    farmLocked = true
+    pcall(fn)
+    farmLocked = false
+end
+
+-- Loop registry: toggling a feature off then on used to spawn a SECOND copy of
+-- the same loop (both kept running because they both saw flags.X == true).
+-- Running only the registered copy prevents stale duplicate loops from acting
+-- after a re-toggle.
+local runningLoops = {}
+local function spawnLoop(flagKey, fn)
+    if runningLoops[flagKey] then return end
+    runningLoops[flagKey] = true
+    task.spawn(function()
+        pcall(fn)
+        runningLoops[flagKey] = false
+    end)
+end
+
 -- Auto Upgrade Feeder: raise every generator toward maxLevel, cheapest first
 local function runUpgradeFeeder()
     while hubAlive() and flags.upgradeFeeder do
@@ -310,7 +338,7 @@ local function runUpgradeFeeder()
             end
         end
         if bestSlot and money() >= (bestCost or 0) then
-            pcallInvoke(R.UpgradeGenerator, bestSlot)
+            withFarmLock(function() pcallInvoke(R.UpgradeGenerator, bestSlot) end)
         end
         task.wait(0.25)
     end
@@ -327,13 +355,13 @@ local function runBuyFeeder()
             -- need to expand the coop to open another slot
             local cost = math.floor(GC.expandCost.base * (GC.expandCost.growth ^ math.max(0, cur - GC.coopMinSize)))
             if money() >= cost then
-                pcallInvoke(R.ExpandCoop)
+                withFarmLock(function() pcallInvoke(R.ExpandCoop) end)
                 task.wait(1.5)
             end
         elseif cur < GC.maxSlots and cur < slots then
             local cost = math.floor(GC.buyCost.base * (GC.buyCost.growth ^ math.max(0, cur - 1)))
             if money() >= cost then
-                pcallInvoke(R.BuyGenerator, cur + 1)
+                withFarmLock(function() pcallInvoke(R.BuyGenerator, cur + 1) end)
                 task.wait(1.5)
             end
         end
@@ -418,7 +446,7 @@ local function runRebirthFarm()
             if cur < 2 and cur < slots then
                 local cost = math.floor(GC.buyCost.base * (GC.buyCost.growth ^ math.max(0, cur - 1)))
                 if money() >= cost then
-                    pcallInvoke(R.BuyGenerator, cur + 1)
+                    withFarmLock(function() pcallInvoke(R.BuyGenerator, cur + 1) end)
                     task.wait(0.15)
                 end
             end
@@ -435,7 +463,7 @@ local function runRebirthFarm()
                 end
             end
             if bestSlot and money() >= (bestCost or 0) then
-                pcallInvoke(R.UpgradeGenerator, bestSlot)
+                withFarmLock(function() pcallInvoke(R.UpgradeGenerator, bestSlot) end)
             end
             task.wait(0.12)
         end
@@ -474,7 +502,7 @@ local function runUpgradeCoop()
         if slots < GC.maxSlots and CoopView.canExpand(slots) then
             local cost = CoopView.expandCost(slots) or 0
             if money() >= cost then
-                pcallInvoke(R.ExpandCoop)
+                withFarmLock(function() pcallInvoke(R.ExpandCoop) end)
                 task.wait(0.4)
             end
         end
@@ -900,7 +928,7 @@ for _, t in ipairs(toggles) do
         Default = flags[flagKey] == true,
         Callback = function(v)
             flags[flagKey] = v
-            if v then task.spawn(fn) end
+            if v then spawnLoop(flagKey, fn) end
         end,
     })
 end
