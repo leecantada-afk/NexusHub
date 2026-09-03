@@ -549,8 +549,9 @@ local function runRebirth()
             pcallInvoke(R.TowerSurrender)
             task.wait(1.0)
         end
-        local v = vitals()
-        if atCorral() and towerBest() >= 1 and (v.health or 1) >= 0.999 then
+        -- fire the instant the chicken is home at the corral (no health wait;
+        -- the server only requires being home + meeting the floor)
+        if rebirthReady() and atCorral() then
             pcallInvoke(R.Rebirth)
             task.wait(3)
         end
@@ -613,13 +614,14 @@ local function runRebirthFarm()
         end
     end)
     -- Tower + rebirth loop: slower paced, independent of the feeder loop.
+    -- Fires rebirth the instant the chicken retreats to the corral (the server
+    -- only requires being home + meeting the floor: no full-health wait).
     while hubAlive() and flags.rebirthFarm do
         if rebirthReady() and not atCorral() then
             pcallInvoke(R.TowerSurrender)
             task.wait(1.0)
         end
-        local v = vitals()
-        if rebirthReady() and atCorral() and towerBest() >= 1 and (v.health or 1) >= 0.999 then
+        if rebirthReady() and atCorral() then
             pcallInvoke(R.Rebirth)
             task.wait(3)
         end
