@@ -592,37 +592,44 @@ local function runRebirthFarm()
         -- 2) auto farm tower (never when rebirth is about to fire)
         if not rebirthReady() and (vitals().health or 1) >= 0.999 then
             task.spawn(function() pcallInvoke(R.TowerStart, towerStartFloor()) end)
-            task.wait(2.5)
+            task.wait(0.5)
         end
-        -- 3) make sure we have exactly 2 feeders: buy up to 2 (never a 3rd,
-        --    never expand the coop). Then upgrade only the first two farms,
-        --    cheapest of the two first.
-        local c = coop()
-        local gens = c.generators or {}
-        local slots = c.slots or #gens
-        local cur = #gens
-        if cur < 2 and cur < slots then
-            -- a free slot exists (no expansion needed) -> buy the next feeder
-            local cost = math.floor(GC.buyCost.base * (GC.buyCost.growth ^ math.max(0, cur - 1)))
-            if money() >= cost then
-                pcallInvoke(R.BuyGenerator, cur + 1)
-                task.wait(1.5)
-            end
-        end
-        local bestSlot, bestCost = nil, nil
-        for i = 1, math.min(2, #gens) do
-            local g = gens[i]
-            if g and g.level and g.level < GC.maxLevel then
-                local cost = math.floor(GC.upgradeCost.base * (GC.upgradeCost.growth ^ math.max(0, g.level - 1)))
-                if bestSlot == nil or cost < bestCost then
-                    bestCost, bestSlot = cost, g.slot
+        -- 3) feed/upgrade: buy up to exactly 2 feeders (never a 3rd, never
+        --    expand the coop), then raise both to max fast. Runs hot so the
+        --    farms keep up with rebirth/tower income.
+        for _ = 1, 10 do
+            if not (hubAlive() and flags.rebirthFarm) then break end
+            local c = coop()
+            local gens = c.generators or {}
+            local slots = c.slots or #gens
+            local cur = #gens
+            if cur < 2 and cur < slots then
+                local cost = math.floor(GC.buyCost.base * (GC.buyCost.growth ^ math.max(0, cur - 1)))
+                if money() >= cost then
+                    pcallInvoke(R.BuyGenerator, cur + 1)
+                    task.wait(0.15)
                 end
             end
+            local c2 = coop()
+            local gens2 = c2.generators or {}
+            local bestSlot, bestCost = nil, nil
+            for i = 1, math.min(2, #gens2) do
+                local g = gens2[i]
+                if g and g.level and g.level < GC.maxLevel then
+                    local cost = math.floor(GC.upgradeCost.base * (GC.upgradeCost.growth ^ math.max(0, g.level - 1)))
+                    if bestSlot == nil or cost < bestCost then
+                        bestCost, bestSlot = cost, g.slot
+                    end
+                end
+            end
+            if bestSlot and money() >= (bestCost or 0) then
+                pcallInvoke(R.UpgradeGenerator, bestSlot)
+                task.wait(0.15)
+            else
+                break -- nothing affordable/upgradeable left; stop this burst
+            end
         end
-        if bestSlot and money() >= (bestCost or 0) then
-            pcallInvoke(R.UpgradeGenerator, bestSlot)
-        end
-        task.wait(0.7)
+        task.wait(0.4)
     end
     if rfContinueConn then
         pcall(function() rfContinueConn:Disconnect() end)
