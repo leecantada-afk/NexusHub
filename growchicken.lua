@@ -63,6 +63,7 @@ local flags = {
     towerStrategy = "frontier",
     upgradeCoop = false,
     upgradeRecycler = false,
+    collectEggs = false,
     autoIncubator = false,
     autoClaimEggIncubator = false,
     autoUpgradeIncubator = false,
@@ -414,6 +415,104 @@ local function runHatchEggs()
             end
         end
         task.wait(2.0)
+    end
+end
+
+-- Noclip: temporarily disable the home coop's fences and the character's own
+-- collision so the chicken can walk through them to reach eggs pressed against
+-- the walls. Restores nothing persistently — the fence parts are static and the
+-- server owns their CanCollide; we only flip it while Auto Collect Eggs is on.
+local function coopFloorOf(model)
+    local fl = model and model:FindFirstChild("Floor")
+    if not fl then return nil end
+    return fl.Position, (fl.Size.X or 30) / 2
+end
+
+-- The player's own coop: the coop currently containing the character's root
+-- (falls back to the coop containing the active chicken).
+local function homeCoop()
+    local hrp = getCharRoot()
+    local c = game:GetService("Workspace"):FindFirstChild("Coops")
+    if c then
+        for _, m in ipairs(c:GetChildren()) do
+            if m.Name ~= "CoopUI" and m.Name ~= "NeighborCoop" then
+                local cx, half = coopFloorOf(m)
+                if cx and hrp and math.abs(hrp.Position.X - cx.X) < half
+                    and math.abs(hrp.Position.Z - cx.Z) < half then
+                    return m
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- All NestEgg parts sitting inside the given coop's floor bounds.
+local function coopEggs(coop)
+    local cx, half = coopFloorOf(coop)
+    if not cx then return {} end
+    local out = {}
+    local nest = game:GetService("Workspace"):FindFirstChild("NestEggs")
+    if nest then
+        for _, e in ipairs(nest:GetChildren()) do
+            if e:IsA("BasePart")
+                and math.abs(e.Position.X - cx.X) < half
+                and math.abs(e.Position.Z - cx.Z) < half then
+                table.insert(out, e)
+            end
+        end
+    end
+    return out
+end
+
+-- Auto Collect Eggs: walk the chicken onto each egg inside the player's own
+-- coop. Collection is character-touch based, so we make the coop fences
+-- passable (CanCollide=false) plus noclip the character, walk to each egg, and
+-- wait for it to disappear before moving to the next.
+local function runCollectEggs()
+    local coop = homeCoop()
+    while hubAlive() and flags.collectEggs do
+        if not coop then coop = homeCoop() end
+        if coop then
+            -- make fences passable + noclip the character
+            for _, v in ipairs(coop:GetDescendants()) do
+                if v:IsA("BasePart") and v.Name ~= "Floor" then
+                    pcall(function() v.CanCollide = false end)
+                end
+            end
+            local hrp = getCharRoot()
+            local hum = Player.Character and Player.Character:FindFirstChildOfClass("Humanoid")
+            if hrp then pcall(function() hrp.CanCollide = false end) end
+
+            local eggs = coopEggs(coop)
+            if #eggs > 0 and hum and hrp then
+                for _, egg in ipairs(eggs) do
+                    if not (hubAlive() and flags.collectEggs) then break end
+                    local target = egg.Position
+                    hum:MoveTo(target)
+                    local waited = 0
+                    while waited < 15000 do
+                        task.wait(0.4)
+                        waited = waited + 400
+                        if hrp and (hrp.Position - target).Magnitude > 1.5 then
+                            pcall(function() hum:MoveTo(target) end)
+                        end
+                        if not egg.Parent then break end          -- collected / despawned
+                        if not (hubAlive() and flags.collectEggs) then break end
+                    end
+                    task.wait(0.5)
+                end
+            end
+        end
+        task.wait(3.0)
+    end
+    -- flip fences back once the loop ends
+    if coop then
+        for _, v in ipairs(coop:GetDescendants()) do
+            if v:IsA("BasePart") and v.Name ~= "Floor" then
+                pcall(function() v.CanCollide = true end)
+            end
+        end
     end
 end
 
@@ -850,6 +949,7 @@ local toggles = {
     { "farm",   "Farming",    "Auto Buy Feeder",            "buyFeeder",              runBuyFeeder },
     { "farm",   "Farming",    "Auto Send Tower",            "sendTower",              runSendTower },
     { "farm",   "Farming",    "Auto Hatch Eggs",            "hatchEggs",              runHatchEggs },
+    { "farm",   "Farming",    "Auto Collect Eggs",          "collectEggs",            runCollectEggs },
     { "farm",   "Farming",    "Auto Rebirth",               "rebirth",                runRebirth },
     { "farm",   "Farming",    "Auto Upgrade Coop",          "upgradeCoop",            runUpgradeCoop },
     { "farm",   "Farming",    "Auto Upgrade Recycler",      "upgradeRecycler",        runUpgradeRecycler },
