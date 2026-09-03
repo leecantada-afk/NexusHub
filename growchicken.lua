@@ -560,12 +560,17 @@ end
 
 -- Rebirth Farm (beta). ONE toggle drives the whole rebirth grind loop:
 --   * Auto farm tower   -> send the rooster to the strategy floor, refarm
---   * Upgrade 2 farms   -> raise the first TWO generators only; never buys a
---                          new farm and never expands/upgrades the coop
+--   * Keep 2 feeders    -> buy feeders until there are exactly TWO (never a
+--                          third), then upgrade only those two; NEVER expands
+--                          or upgrades the coop
 --   * Retreat / rebirth -> once the rebirth threshold is met, surrender any
 --                          running tower, return to the corral and fire rebirth
 -- It shares the tower continue-decline connection so failed full runs settle
 -- instead of paying to keep going. Everything gates on the single flag.
+-- Auto-click the tower-end "No thanks" button: when the server shows the
+-- tower continue offer (the tower run ended), decline it. This fires the same
+-- TowerContinueDecline remote the game's own "No thanks" button sends, so it
+-- is refused without paying to continue the run.
 local rfContinueConn = nil
 local function runRebirthFarm()
     if not rfContinueConn then
@@ -589,9 +594,21 @@ local function runRebirthFarm()
             task.spawn(function() pcallInvoke(R.TowerStart, towerStartFloor()) end)
             task.wait(2.5)
         end
-        -- 3) upgrade only the first two farms (cheapest of the two), never buy
+        -- 3) make sure we have exactly 2 feeders: buy up to 2 (never a 3rd,
+        --    never expand the coop). Then upgrade only the first two farms,
+        --    cheapest of the two first.
         local c = coop()
         local gens = c.generators or {}
+        local slots = c.slots or #gens
+        local cur = #gens
+        if cur < 2 and cur < slots then
+            -- a free slot exists (no expansion needed) -> buy the next feeder
+            local cost = math.floor(GC.buyCost.base * (GC.buyCost.growth ^ math.max(0, cur - 1)))
+            if money() >= cost then
+                pcallInvoke(R.BuyGenerator, cur + 1)
+                task.wait(1.5)
+            end
+        end
         local bestSlot, bestCost = nil, nil
         for i = 1, math.min(2, #gens) do
             local g = gens[i]
