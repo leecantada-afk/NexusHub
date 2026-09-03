@@ -578,27 +578,11 @@ local function runRebirthFarm()
             task.spawn(function() pcall(Remotes.fire, R.TowerContinueDecline) end)
         end)
     end
-    while hubAlive() and flags.rebirthFarm do
-        -- 1) retreat + rebirth once the threshold is met
-        if rebirthReady() and not atCorral() then
-            pcallInvoke(R.TowerSurrender)
-            task.wait(1.0)
-        end
-        local v = vitals()
-        if rebirthReady() and atCorral() and towerBest() >= 1 and (v.health or 1) >= 0.999 then
-            pcallInvoke(R.Rebirth)
-            task.wait(3)
-        end
-        -- 2) auto farm tower (never when rebirth is about to fire)
-        if not rebirthReady() and (vitals().health or 1) >= 0.999 then
-            task.spawn(function() pcallInvoke(R.TowerStart, towerStartFloor()) end)
-            task.wait(0.5)
-        end
-        -- 3) feed/upgrade: buy up to exactly 2 feeders (never a 3rd, never
-        --    expand the coop), then raise both to max fast. Runs hot so the
-        --    farms keep up with rebirth/tower income.
-        for _ = 1, 10 do
-            if not (hubAlive() and flags.rebirthFarm) then break end
+    -- Feeder loop: continuous, gated only on the flag. Buys up to 2 feeders
+    -- (never a 3rd, never expands), then raises both to max as fast as the
+    -- server round trip allows. Not throttled by the tower/rebirth pacing.
+    task.spawn(function()
+        while hubAlive() and flags.rebirthFarm do
             local c = coop()
             local gens = c.generators or {}
             local slots = c.slots or #gens
@@ -624,12 +608,25 @@ local function runRebirthFarm()
             end
             if bestSlot and money() >= (bestCost or 0) then
                 pcallInvoke(R.UpgradeGenerator, bestSlot)
-                task.wait(0.15)
-            else
-                break -- nothing affordable/upgradeable left; stop this burst
             end
+            task.wait(0.12)
         end
-        task.wait(0.4)
+    end)
+    -- Tower + rebirth loop: slower paced, independent of the feeder loop.
+    while hubAlive() and flags.rebirthFarm do
+        if rebirthReady() and not atCorral() then
+            pcallInvoke(R.TowerSurrender)
+            task.wait(1.0)
+        end
+        local v = vitals()
+        if rebirthReady() and atCorral() and towerBest() >= 1 and (v.health or 1) >= 0.999 then
+            pcallInvoke(R.Rebirth)
+            task.wait(3)
+        end
+        if not rebirthReady() and (vitals().health or 1) >= 0.999 then
+            task.spawn(function() pcallInvoke(R.TowerStart, towerStartFloor()) end)
+        end
+        task.wait(0.6)
     end
     if rfContinueConn then
         pcall(function() rfContinueConn:Disconnect() end)
