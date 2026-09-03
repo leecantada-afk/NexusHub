@@ -469,22 +469,43 @@ end
 -- coop. Collection is character-touch based, so we make the coop fences
 -- passable (CanCollide=false) plus noclip the character, walk to each egg, and
 -- wait for it to disappear before moving to the next.
+local function setNoclip(char, on)
+    if not char then return end
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then pcall(function() p.CanCollide = not on end) end
+    end
+end
+
 local function runCollectEggs()
     local coop = homeCoop()
+    local prevCC = {} -- for restoring collidables
     while hubAlive() and flags.collectEggs do
         if not coop then coop = homeCoop() end
         if coop then
-            -- make fences passable + noclip the character
+            -- remember original CanCollide on coop fences + chicken body, then disable
             for _, v in ipairs(coop:GetDescendants()) do
                 if v:IsA("BasePart") and v.Name ~= "Floor" then
+                    table.insert(prevCC, { part = v, was = v.CanCollide })
                     pcall(function() v.CanCollide = false end)
                 end
             end
-            local hrp = getCharRoot()
-            local hum = Player.Character and Player.Character:FindFirstChildOfClass("Humanoid")
-            if hrp then pcall(function() hrp.CanCollide = false end) end
+            -- also disable the coop's ChickenBody hitbox
+            local coopNum = coop.Name:match("%d+")
+            if coopNum then
+                local cb = game:GetService("Workspace"):FindFirstChild("ChickenBodies")
+                    and game:GetService("Workspace").ChickenBodies:FindFirstChild("ChickenBody_coop:" .. coopNum)
+                if cb and cb:IsA("BasePart") then
+                    table.insert(prevCC, { part = cb, was = cb.CanCollide })
+                    pcall(function() cb.CanCollide = false end)
+                end
+            end
+            -- full-character noclip (all BaseParts, not just HumanoidRootPart)
+            local char = Player.Character
+            setNoclip(char, true)
 
             local eggs = coopEggs(coop)
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
             if #eggs > 0 and hum and hrp then
                 for _, egg in ipairs(eggs) do
                     if not (hubAlive() and flags.collectEggs) then break end
@@ -503,16 +524,16 @@ local function runCollectEggs()
                     task.wait(0.5)
                 end
             end
+            -- restore all collidables
+            for _, entry in ipairs(prevCC) do
+                if entry.part and entry.part.Parent then
+                    pcall(function() entry.part.CanCollide = entry.was end)
+                end
+            end
+            prevCC = {}
+            setNoclip(char, false)
         end
         task.wait(3.0)
-    end
-    -- flip fences back once the loop ends
-    if coop then
-        for _, v in ipairs(coop:GetDescendants()) do
-            if v:IsA("BasePart") and v.Name ~= "Floor" then
-                pcall(function() v.CanCollide = true end)
-            end
-        end
     end
 end
 
