@@ -720,7 +720,9 @@ end
 -- MOVEMENT / UTILITY loops
 ------------------------------------------------------------------
 
--- Anti AFK: periodic movement
+-- Anti AFK (silent): nudge the character's root by an imperceptible amount each
+-- interval. This counts as movement/activity to the server so the 20-minute
+-- idle kick never fires, but there is no visible jumping at all.
 local function runAntiAfk()
     local last = 0
     while hubAlive() and flags.antiAfk do
@@ -729,8 +731,10 @@ local function runAntiAfk()
             last = now
             local hrp = getCharRoot()
             if hrp then
-                local hum = Player.Character and Player.Character:FindFirstChildOfClass("Humanoid")
-                if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+                local cf = hrp.CFrame
+                pcall(function()
+                    hrp.CFrame = cf * CFrame.new(0, 0, 0.001)
+                end)
             end
         end
         task.wait(10)
@@ -764,9 +768,10 @@ local function runAutoChaos()
     end
 end
 
--- Performance Mode
+-- Performance Mode: keeps 3D rendering ON, just trims graphics settings so the
+-- client runs faster/higher fps. Turning the screen off entirely is left to
+-- Ultra Performance Mode.
 local function applyPerformance(on)
-    pcall(function() RunService:Set3dRenderingEnabled(not on) end)
     if on then
         pcall(function() Lighting.GlobalShadows = false end)
         pcall(function() Lighting.Brightness = 1 end)
@@ -775,12 +780,15 @@ local function applyPerformance(on)
     end
 end
 
--- Ultra Performance Mode: everything Performance Mode does, plus aggressively
--- disabling particle/beam effects and dropping the graphics quality level.
--- It is a separate toggle so the two can be mixed however the player wants.
+-- Ultra Performance Mode: turns 3D rendering off entirely for maximum fps, and
+-- instead of the default blank view it shows a full black screen (via a
+-- full-screen black overlay, so it is not white). Also applies the lighter
+-- Performance trims, drops the graphics quality level and disables particles.
+local ultraOverlay = nil
 local function applyUltraPerformance(on)
     applyPerformance(on)
     if on then
+        pcall(function() RunService:Set3dRenderingEnabled(false) end)
         pcall(function() settings():GetService("QualitySettings").QualityLevel = 1 end)
         pcall(function()
             for _, p in ipairs(Lighting:GetDescendants()) do
@@ -789,8 +797,27 @@ local function applyUltraPerformance(on)
                 end
             end
         end)
+        if not ultraOverlay then
+            local sg = Instance.new("ScreenGui")
+            sg.Name = "NexusUltraOverlay"
+            sg.IgnoreGuiInset = true
+            sg.DisplayOrder = 1e9
+            local frame = Instance.new("Frame")
+            frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+            frame.BackgroundTransparency = 0
+            frame.BorderSizePixel = 0
+            frame.Size = UDim2.fromScale(1, 1)
+            frame.Parent = sg
+            sg.Parent = Player:WaitForChild("PlayerGui")
+            ultraOverlay = sg
+        end
     else
+        pcall(function() RunService:Set3dRenderingEnabled(true) end)
         pcall(function() settings():GetService("QualitySettings").QualityLevel = 10 end)
+        if ultraOverlay then
+            pcall(function() ultraOverlay:Destroy() end)
+            ultraOverlay = nil
+        end
     end
 end
 
@@ -811,6 +838,8 @@ local win = Rayfield:CreateWindow({
 -- on reload, tear down the previous run's window so windows don't stack
 if STATE then
     STATE.onCleanup(function()
+        pcall(function() if ultraOverlay then ultraOverlay:Destroy() end end)
+        pcall(function() RunService:Set3dRenderingEnabled(true) end)
         pcall(function() if win then win:Unload() end end)
     end)
 end
@@ -925,6 +954,9 @@ tabs.misc:CreateButton({
         -- kill every loop (hubAlive gates on this) and reset all flags
         getgenv().NX_HUB = false
         for k in pairs(flags) do flags[k] = false end
+        -- restore rendering + remove the black overlay if it was on
+        pcall(function() RunService:Set3dRenderingEnabled(true) end)
+        pcall(function() if ultraOverlay then ultraOverlay:Destroy() end end)
         -- destroy the GUI
         pcall(function() if win then win:Unload() end end)
         getgenv().NX_HUB = nil
