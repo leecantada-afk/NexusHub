@@ -18,7 +18,6 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
 local CollectionService = game:GetService("CollectionService")
-local TweenService = game:GetService("TweenService")
 
 local Player = Players.LocalPlayer
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -80,10 +79,39 @@ local flags = {
     autoClaimPass = false,
     autoShopDust = false,
     autoRedeem = false,
-    antiAfk = false,
+    antiAfk = true,
     performance = false,
-    autoLoadOnTeleport = false,
+    autoLoadOnTeleport = true,
+    autoReconnect = true,
 }
+
+-- Persistent toggle config: the last state of every toggle is saved to a file
+-- in the executor workspace and restored on the next run, so toggles you had
+-- on are already on when you re-execute (also survives rejoin / teleport).
+local SAVE_PATH = "nexus_hub_config.json"
+-- Safety/utility toggles that always start ON every load; a stale saved state
+-- cannot pull them back to off. They can still be toggled off for the session.
+local alwaysOn = {
+    antiAfk = true,
+    autoLoadOnTeleport = true,
+    autoReconnect = true,
+}
+local function loadConfig()
+    local ok, raw = pcall(readfile, SAVE_PATH)
+    if not ok then return end
+    local ok2, data = pcall(json.decode, raw)
+    if not ok2 or type(data) ~= "table" then return end
+    for k, v in pairs(data) do
+        if flags[k] ~= nil and not alwaysOn[k] and type(v) == type(flags[k]) then
+            flags[k] = v
+        end
+    end
+end
+local function saveConfig()
+    local ok, doc = pcall(json.encode, flags)
+    if ok then pcall(writefile, SAVE_PATH, doc) end
+end
+loadConfig()
 
 -- Current known-good codes (server validates each; only valid, unredeemed grant rewards)
 local knownCodes = {
@@ -271,6 +299,43 @@ local function rejoin()
     return hopToJob(game.JobId)
 end
 
+-- Auto Reconnect: when enabled, if we get kicked or removed from the server,
+-- teleport straight back into the same server (Auto Load on Teleport reloads
+-- the hub on arrival). Watches LocalPlayer's Parent — a kick sets it to nil.
+local reconnectConn = nil
+local function runAutoReconnect()
+    if reconnectConn then
+        pcall(function() reconnectConn:Disconnect() end)
+        reconnectConn = nil
+    end
+    local reconnectToken = { armed = false }
+    local function tryReconnect()
+        if not (hubAlive() and flags.autoReconnect) then return end
+        if reconnectToken.armed then return end -- only one reconnect per removal
+        reconnectToken.armed = true
+        task.spawn(function()
+            task.wait(0.8) -- let the kick / server state settle before bouncing back
+            if hubAlive() and flags.autoReconnect then
+                queueHubReload()
+                pcall(function()
+                    game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId)
+                end)
+            end
+            reconnectToken.armed = false
+        end)
+    end
+    local changedConn = Player:GetPropertyChangedSignal("Parent"):Connect(tryReconnect)
+    local removingConn = game:GetService("Players").PlayerRemoving:Connect(function(p)
+        if p == Player then tryReconnect() end
+    end)
+    while hubAlive() and flags.autoReconnect do
+        task.wait(5)
+    end
+    pcall(function() changedConn:Disconnect() end)
+    pcall(function() removingConn:Disconnect() end)
+    reconnectConn = nil
+end
+
 ------------------------------------------------------------------
 -- FARM loops
 ------------------------------------------------------------------
@@ -354,7 +419,7 @@ local function runSendTower()
     end
     while hubAlive() and flags.sendTower do
         local v = vitals()
-        if (v.health or 1) >= 0.999 and not rebirthReady() then
+        if (v.health or 1) >= 0.999 and not (flags.rebirth and rebirthReady()) then
             task.spawn(function() pcallInvoke(R.TowerStart, towerStartFloor()) end)
             task.wait(2.5)
         end
@@ -418,15 +483,23 @@ local function runCollectEggs()
     end
 end
 
--- Auto Rebirth: rebuild when idle, at full health, and resting at the corral
+-- Auto Rebirth: when rebirth is on and the requirement is met, actively
+-- surrender any running tower so the chicken retreats to the corral, then
+-- rebuild once it's home and back to full health. No more waiting for the
+-- tower to lose before coming back.
 local function runRebirth()
     while hubAlive() and flags.rebirth do
+        if rebirthReady() and not atCorral() then
+            -- chicken is away on a tower run / campaign: pull it back now
+            pcallInvoke(R.TowerSurrender)
+            task.wait(1.0)
+        end
         local v = vitals()
         if atCorral() and towerBest() >= 1 and (v.health or 1) >= 0.999 then
             pcallInvoke(R.Rebirth)
             task.wait(3)
         end
-        task.wait(1.0)
+        task.wait(0.7)
     end
 end
 
@@ -653,7 +726,7 @@ local function runClaimMissions()
     while hubAlive() and flags.claimMissions do
         local md = missionStateData()
         for _, scope in ipairs(MissionView.SCOPES) do
-            local act, aerr = pcall(MissionView.active, scope)
+            local act = pcall(MissionView.active, scope)
             if type(act) == "table" then
                 for _, m in ipairs(act) do
                     if m.kind == nil and MissionView.stateOf(md, m) == "ready" then
@@ -822,7 +895,7 @@ local win = Rayfield:CreateWindow({
     Subtitle = "Grow a Chicken Fighter",
     LoadingTitle = "NEXUS HUB",
     LoadingSubtitle = "by Real",
-    ConfigurationSaving = { Enabled = true, FolderName = "NexusHub", FileName = "settings" },
+    ConfigurationSaving = { Enabled = false, FolderName = "NexusHub", FileName = "settings" },
     Discord = { Enabled = false },
     KeySystem = false,
     ToggleUIKeybind = Enum.KeyCode.LeftControl,
@@ -889,12 +962,23 @@ for _, t in ipairs(toggles) do
     end
     tabs[tabKey]:CreateToggle({
         Name = name,
-        Default = false,
+        Default = flags[flagKey] == true,
         Callback = function(v)
             flags[flagKey] = v
+            saveConfig()
             if v then task.spawn(fn) end
         end,
     })
+end
+
+-- Re-engage persisted-on toggles. Rayfield does NOT fire a toggle's Callback
+-- at creation for Default=true, so a restored "on" toggle would render loaded
+-- but its loop would never start. Spawn it here explicitly (single path, so
+-- no duplicate loops).
+for _, t in ipairs(toggles) do
+    if flags[t[4]] == true then
+        task.spawn(t[5])
+    end
 end
 
 -- Auto Farm tower start strategy (Auto Send Tower uses this to pick the floor)
@@ -935,8 +1019,12 @@ tabs.misc:CreateInput({
 -- Performance Mode toggle (immediate, not a loop)
 tabs.misc:CreateToggle({
     Name = "Performance Mode",
-    Default = false,
-    Callback = function(v) flags.performance = v; applyPerformance(v) end,
+    Default = flags.performance == true,
+    Callback = function(v)
+        flags.performance = v
+        saveConfig()
+        applyPerformance(v)
+    end,
 })
 
 -- Misc / Hub: unload everything
@@ -947,6 +1035,8 @@ tabs.misc:CreateButton({
         -- kill every loop (hubAlive gates on this) and reset all flags
         getgenv().NX_HUB = false
         for k in pairs(flags) do flags[k] = false end
+        -- clear any persisted config so a future run starts fresh
+        saveConfig()
         -- destroy the GUI
         pcall(function() if win then win:Unload() end end)
         getgenv().NX_HUB = nil
@@ -954,7 +1044,7 @@ tabs.misc:CreateButton({
 })
 
 -- Server tab: same-place server hopping + rejoin
-local serverSection = tabs.server:CreateSection({ Name = "Server" })
+tabs.server:CreateSection({ Name = "Server" })
 tabs.server:CreateButton({
     Name = "Server Hop",
     Callback = function()
@@ -975,8 +1065,24 @@ tabs.server:CreateButton({
 })
 tabs.server:CreateToggle({
     Name = "Auto Load on Teleport",
-    Default = false,
-    Callback = function(v) flags.autoLoadOnTeleport = v end,
+    Default = flags.autoLoadOnTeleport == true,
+    Callback = function(v)
+        flags.autoLoadOnTeleport = v
+        saveConfig()
+    end,
 })
+tabs.server:CreateToggle({
+    Name = "Auto Reconnect (rejoin on kick)",
+    Default = flags.autoReconnect == true,
+    Callback = function(v)
+        flags.autoReconnect = v
+        saveConfig()
+        if v then task.spawn(runAutoReconnect) end
+    end,
+})
+
+-- re-engage any persisted states whose side effects only run in the callbacks
+if flags.performance then applyPerformance(true) end
+if flags.autoReconnect then task.spawn(runAutoReconnect) end
 
 getgenv().NX_HUB = true
