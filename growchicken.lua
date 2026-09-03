@@ -17,7 +17,6 @@ local gen = getgenv().NEXUS_GEN
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
-local CollectionService = game:GetService("CollectionService")
 
 local Player = Players.LocalPlayer
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -59,7 +58,6 @@ local flags = {
     buyFeeder = false,
     sendTower = false,
     hatchEggs = false,
-    collectEggs = false,
     rebirth = false,
     -- tower strategy: "frontier" | "warmup" | "bottom"
     towerStrategy = "frontier",
@@ -79,39 +77,11 @@ local flags = {
     autoClaimPass = false,
     autoShopDust = false,
     autoRedeem = false,
-    antiAfk = true,
+    antiAfk = false,
     performance = false,
-    autoLoadOnTeleport = true,
-    autoReconnect = true,
+    autoLoadOnTeleport = false,
+    autoReconnect = false,
 }
-
--- Persistent toggle config: the last state of every toggle is saved to a file
--- in the executor workspace and restored on the next run, so toggles you had
--- on are already on when you re-execute (also survives rejoin / teleport).
-local SAVE_PATH = "nexus_hub_config.json"
--- Safety/utility toggles that always start ON every load; a stale saved state
--- cannot pull them back to off. They can still be toggled off for the session.
-local alwaysOn = {
-    antiAfk = true,
-    autoLoadOnTeleport = true,
-    autoReconnect = true,
-}
-local function loadConfig()
-    local ok, raw = pcall(readfile, SAVE_PATH)
-    if not ok then return end
-    local ok2, data = pcall(json.decode, raw)
-    if not ok2 or type(data) ~= "table" then return end
-    for k, v in pairs(data) do
-        if flags[k] ~= nil and not alwaysOn[k] and type(v) == type(flags[k]) then
-            flags[k] = v
-        end
-    end
-end
-local function saveConfig()
-    local ok, doc = pcall(json.encode, flags)
-    if ok then pcall(writefile, SAVE_PATH, doc) end
-end
-loadConfig()
 
 -- Current known-good codes (server validates each; only valid, unredeemed grant rewards)
 local knownCodes = {
@@ -447,42 +417,6 @@ local function runHatchEggs()
     end
 end
 
--- Auto Collect Eggs: only collect YOUR OWN chicken's eggs laid inside your coop
-local function runCollectEggs()
-    while hubAlive() and flags.collectEggs do
-        local eggs = CollectionService:GetTagged("NestEgg")
-        for _, egg in ipairs(eggs) do
-            if not hubAlive() or not flags.collectEggs then break end
-            if egg:GetAttribute("owner") ~= Player.UserId then continue end
-            local hrp = getCharRoot()
-            if hrp and egg:IsA("BasePart") then
-                local target = egg.Position
-                -- bring the character within ~4 studs
-                pcall(function()
-                    local bv = Instance.new("BodyVelocity")
-                    bv.MaxForce = Vector3.new(1e6, 1e6, 1e6)
-                    bv.Velocity = (target - hrp.Position).Unit * 40
-                    bv.Parent = hrp
-                    task.wait(0.6)
-                    bv:Destroy()
-                end)
-                -- click the egg with a native click
-                pcall(function()
-                    local cam = workspace.CurrentCamera
-                    if cam then
-                        local sp, on = cam:WorldToScreenPoint(target)
-                        if on then mousemoveabs(sp.X, sp.Y) end
-                    end
-                    task.wait(0.15)
-                    mouse1click()
-                end)
-                task.wait(0.8)
-            end
-        end
-        task.wait(2.0)
-    end
-end
-
 -- Auto Rebirth: when rebirth is on and the requirement is met, actively
 -- surrender any running tower so the chicken retreats to the corral, then
 -- rebuild once it's home and back to full health. No more waiting for the
@@ -553,7 +487,7 @@ local function runAutoIncubator()
         end
 
         -- insert / swap the best chicken into the incubator when idle
-        local idle = (inc.progress or 0) <= 0 and #eggs == 0 and inc.level >= 0
+        local idle = (inc.progress or 0) <= 0 and #eggs == 0
         if idle then
             local list = chickenList()
             local best
@@ -712,11 +646,12 @@ end
 
 local function missionStateData()
     local ok2, missions = pcall(function() return client:get({"missions"}) end)
+    local ok3, scrap = pcall(function() return client:get({"scrap"}) end)
     return {
         roster = roster(),
         towerBest = towerBest(),
         rebirthCount = rebirthCount(),
-        recyclerLevel = 0,
+        recyclerLevel = (ok3 and scrap and scrap.recyclerLevel) or 0,
         missions = (ok2 and missions) or {},
     }
 end
@@ -915,7 +850,6 @@ local toggles = {
     { "farm",   "Farming",    "Auto Buy Feeder",            "buyFeeder",              runBuyFeeder },
     { "farm",   "Farming",    "Auto Send Tower",            "sendTower",              runSendTower },
     { "farm",   "Farming",    "Auto Hatch Eggs",            "hatchEggs",              runHatchEggs },
-    { "farm",   "Farming",    "Auto Collect Eggs",          "collectEggs",            runCollectEggs },
     { "farm",   "Farming",    "Auto Rebirth",               "rebirth",                runRebirth },
     { "farm",   "Farming",    "Auto Upgrade Coop",          "upgradeCoop",            runUpgradeCoop },
     { "farm",   "Farming",    "Auto Upgrade Recycler",      "upgradeRecycler",        runUpgradeRecycler },
@@ -965,20 +899,9 @@ for _, t in ipairs(toggles) do
         Default = flags[flagKey] == true,
         Callback = function(v)
             flags[flagKey] = v
-            saveConfig()
             if v then task.spawn(fn) end
         end,
     })
-end
-
--- Re-engage persisted-on toggles. Rayfield does NOT fire a toggle's Callback
--- at creation for Default=true, so a restored "on" toggle would render loaded
--- but its loop would never start. Spawn it here explicitly (single path, so
--- no duplicate loops).
-for _, t in ipairs(toggles) do
-    if flags[t[4]] == true then
-        task.spawn(t[5])
-    end
 end
 
 -- Auto Farm tower start strategy (Auto Send Tower uses this to pick the floor)
@@ -1022,7 +945,6 @@ tabs.misc:CreateToggle({
     Default = flags.performance == true,
     Callback = function(v)
         flags.performance = v
-        saveConfig()
         applyPerformance(v)
     end,
 })
@@ -1035,8 +957,6 @@ tabs.misc:CreateButton({
         -- kill every loop (hubAlive gates on this) and reset all flags
         getgenv().NX_HUB = false
         for k in pairs(flags) do flags[k] = false end
-        -- clear any persisted config so a future run starts fresh
-        saveConfig()
         -- destroy the GUI
         pcall(function() if win then win:Unload() end end)
         getgenv().NX_HUB = nil
@@ -1068,7 +988,6 @@ tabs.server:CreateToggle({
     Default = flags.autoLoadOnTeleport == true,
     Callback = function(v)
         flags.autoLoadOnTeleport = v
-        saveConfig()
     end,
 })
 tabs.server:CreateToggle({
@@ -1076,12 +995,11 @@ tabs.server:CreateToggle({
     Default = flags.autoReconnect == true,
     Callback = function(v)
         flags.autoReconnect = v
-        saveConfig()
         if v then task.spawn(runAutoReconnect) end
     end,
 })
 
--- re-engage any persisted states whose side effects only run in the callbacks
+-- apply any states already active this run (loops gate on these flags)
 if flags.performance then applyPerformance(true) end
 if flags.autoReconnect then task.spawn(runAutoReconnect) end
 
