@@ -134,12 +134,24 @@ local function vitals()
     return { health = 1 }
 end
 
+local function _dump(o, seen)
+    if type(o) ~= "table" then return tostring(o) end
+    seen = seen or {}
+    if seen[o] then return "(cycle)" end
+    seen[o] = true
+    local parts = {}
+    for k, v in pairs(o) do
+        parts[#parts + 1] = tostring(k) .. "=" .. _dump(v, seen)
+    end
+    return "{" .. table.concat(parts, ", ") .. "}"
+end
+
 local towerDebugOnce = false
 local function towerBest()
     local ok, t = pcall(function() return client:get({"tower"}) end)
     if not towerDebugOnce then
         towerDebugOnce = true
-        print("[NEXUS] raw tower data:", ok and t or t)
+        print("[NEXUS] raw tower data:", ok and _dump(t) or tostring(t))
     end
     if ok and t and t.best then return t.best end
     return 0
