@@ -87,11 +87,8 @@ local flags = {
     towerStrategy = "frontier",
     -- Rebirth Farm smart start: always try the FRONTIER (highest reachable
     -- floor) first, but fall back to warm-up -> floor 1 if the frontier's paid
-    -- elevator ride can't be afforded. `towerStartReserve` is the minimum cash
-    -- kept aside for a tower ride while Rebirth Farm is on; feeder purchases /
-    -- upgrades pause below it so the frontier start stays affordable.
+    -- elevator ride can't be afforded.
     towerStartSmart = true,
-    towerStartReserve = 0,
     upgradeCoop = false,
     upgradeRecycler = false,
     autoClaimEggIncubator = false,
@@ -516,22 +513,15 @@ local function runRebirthFarm()
     -- Feeder loop: continuous, gated only on the flag. Buys up to 2 feeders
     -- (never a 3rd, never expands), then raises both to max as fast as the
     -- server round trip allows. Not throttled by the tower/rebirth pacing.
-    -- When smart tower start is on, feeder spending is held back by a reserve
-    -- so the cash for the (paid) frontier elevator ride is never drained by
-    -- the feeder buying/upgrading itself.
     task.spawn(function()
         while hubAlive() and flags.rebirthFarm do
-            local reserve = flags.towerStartSmart and (flags.towerStartReserve or 0) or 0
-            local canSpend = function(cost)
-                return money() - (cost or 0) >= reserve
-            end
             local c = coop()
             local gens = c.generators or {}
             local slots = c.slots or #gens
             local cur = #gens
             if cur < 2 and cur < slots then
                 local cost = math.floor(GC.buyCost.base * (GC.buyCost.growth ^ math.max(0, cur - 1)))
-                if canSpend(cost) then
+                if money() >= cost then
                     withFarmLock(function() pcallInvoke(R.BuyGenerator, cur + 1) end)
                     task.wait(0.15)
                 end
@@ -548,7 +538,7 @@ local function runRebirthFarm()
                     end
                 end
             end
-            if bestSlot and canSpend(bestCost) then
+            if bestSlot and money() >= (bestCost or 0) then
                 withFarmLock(function() pcallInvoke(R.UpgradeGenerator, bestSlot) end)
             end
             task.wait(0.12)
@@ -1179,23 +1169,12 @@ tabs.farm:CreateDropdown({
 })
 
 -- Rebirth Farm smart tower start: always try the frontier, falling back to
--- warm-up -> floor 1 if the frontier's paid elevator ride can't be afforded,
--- and hold a cash reserve so feeder upgrades can't drain the tower-start cash.
+-- warm-up -> floor 1 if the frontier's paid elevator ride can't be afforded.
 tabs.rfarm:CreateToggle({
     Name = "Smart Tower Start (frontier)",
     Default = flags.towerStartSmart,
     Callback = function(v)
         flags.towerStartSmart = v
-    end,
-})
-tabs.rfarm:CreateSlider({
-    Name = "Tower Start Cash Reserve",
-    Range = { 0, 1000000 },
-    Increment = 1000,
-    Suffix = " cash",
-    CurrentValue = flags.towerStartReserve or 0,
-    Callback = function(v)
-        flags.towerStartReserve = v
     end,
 })
 
