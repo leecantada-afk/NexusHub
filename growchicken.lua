@@ -85,10 +85,6 @@ local flags = {
     rebirthFarm = false, -- one toggle = auto tower + 2-farm upgrade + retreat-rebirth
     -- tower strategy: "frontier" | "warmup" | "bottom"
     towerStrategy = "frontier",
-    -- Rebirth Farm smart start: always try the FRONTIER (highest reachable
-    -- floor) first, but fall back to warm-up -> floor 1 if the frontier's paid
-    -- elevator ride can't be afforded.
-    towerStartSmart = true,
     upgradeCoop = false,
     upgradeRecycler = false,
     autoClaimEggIncubator = false,
@@ -369,11 +365,6 @@ local function spawnLoop(flagKey, fn)
     end)
 end
 
--- Plain flag switch with no background loop (e.g. the Smart Tower Start
--- option toggled while Rebirth Farm is off); Rebirth Farm reads the flag
--- directly. Returns immediately so spawnLoop doesn't spin a loop.
-local function runPassive() end
-
 -- Auto Upgrade Feeder: raise every generator toward maxLevel, cheapest first
 local function runUpgradeFeeder()
     while hubAlive() and flags.upgradeFeeder do
@@ -575,11 +566,7 @@ local function runRebirthFarm()
         else
             if atCorral() and (vitals().health or 1) >= 0.999 then
                 task.spawn(function()
-                    if flags.towerStartSmart then
-                        towerStartSmart()
-                    else
-                        pcallInvoke(R.TowerStart, towerStartFloor())
-                    end
+                    towerStartSmart()
                 end)
             end
         end
@@ -1103,12 +1090,11 @@ if STATE then
 end
 
 -- toggle registration: { tab, section, name, flag, fn[, default] }
--- Entries with fn = runPassive are plain flag switches (no background loop);
--- Rebirth Farm reads their flag directly while running.
+-- Rebirth Farm is ONE toggle: it drives the feeder loop, the auto tower
+-- (frontier -> warm-up -> floor 1 fallback) and the retreat-rebirth cycle.
 local toggles = {
     -- Rebirth Farm tab
     { "rfarm",  "Rebirth Farm","Auto Rebirth Farm",          "rebirthFarm",            runRebirthFarm },
-    { "rfarm",  "Rebirth Farm","Smart Tower Start (frontier)","towerStartSmart",        runPassive },
 
     -- Farm tab
     { "farm",   "Farming",    "Auto Send Tower",            "sendTower",              runSendTower },
