@@ -441,7 +441,11 @@ end
 -- Smart tower start used by Rebirth Farm. Always try the highest reachable
 -- (frontier) floor first; if that fails to fire, step down to warm-up
 -- (frontier minus a small offset), and if that also fails, start at floor 1.
--- No money requirement gating — just chain through the options in order.
+-- Each attempt is fired and then given a beat to actually take hold: the
+-- chicken only counts as started once it leaves the corral, so the next
+-- candidate is only tried when the previous one clearly didn't start. This
+-- avoids firing all three back-to-back (which makes the server honor only
+-- the last one, i.e. floor 1).
 local function towerStartSmart()
     if flags.towerStrategy == "bottom" then
         return pcallInvoke(R.TowerStart, 1)
@@ -449,8 +453,12 @@ local function towerStartSmart()
     local front = Ladder.frontier(towerBest())
     local warm = math.max(1, front - TOWER_WARMUP_OFFSET)
     for _, floor in ipairs({ front, warm, 1 }) do
-        local ok = pcallInvoke(R.TowerStart, floor)
-        if ok then return true, floor end
+        pcallInvoke(R.TowerStart, floor)
+        task.wait(1.0)
+        if not atCorral() then
+            -- chicken left the corral -> a tower run actually started
+            return true, floor
+        end
     end
     return false
 end
