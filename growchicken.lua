@@ -146,13 +146,8 @@ local function _dump(o, seen)
     return "{" .. table.concat(parts, ", ") .. "}"
 end
 
-local towerDebugOnce = false
 local function towerBest()
     local ok, t = pcall(function() return client:get({"tower"}) end)
-    if not towerDebugOnce then
-        towerDebugOnce = true
-        print("[NEXUS] raw tower data:", ok and _dump(t) or tostring(t))
-    end
     if ok and t and t.best then return t.best end
     return 0
 end
@@ -451,6 +446,26 @@ local function towerStartFloor()
     end
 end
 
+-- Start a tower run at the given floor, mirroring exactly what the game's
+-- controller does (ElevatorController/CampaignController.startRun):
+--   1) TowerElevator:InvokeServer(floor)  picks the starting floor for the run
+--   2) ChickenMode.order("tower")         switches the chicken into tower mode
+--   3) TowerStart:InvokeServer()          actually begins the run
+-- TowerElevator alone only SELECTS the floor; the run never starts until
+-- TowerStart fires, which is why the chicken stayed at the corral before.
+-- Returns true if the whole sequence invoked without error.
+local function towerStartRemote(floor)
+    local ok, err = pcall(function()
+        inv(R.TowerElevator, floor)
+        ChickenMode.order("tower")
+        inv(R.TowerStart)
+    end)
+    if not ok then
+        warn(string.format("[NEXUS] towerStart FAILED (floor %s): %s", tostring(floor), tostring(err)))
+    end
+    return ok, err
+end
+
 -- Wait up to ~3s for the chicken to actually leave the corral after a tower
 -- start, i.e. confirm the run really began on the floor we picked. Returns
 -- true once the chicken is no longer resting at the corral.
@@ -471,14 +486,16 @@ end
 -- back-to-back, which made the server honor only the last one (floor 1).
 local function towerStartSmart()
     if flags.towerStrategy == "bottom" then
-        pcallInvoke(R.TowerStart, 1)
+        towerStartRemote(1)
         return waitForStart()
     end
     local front = towerFrontier()
     local warm = math.max(1, front - TOWER_WARMUP_OFFSET)
     for _, floor in ipairs({ front, warm, 1 }) do
-        pcallInvoke(R.TowerStart, floor)
-        if waitForStart() then
+        local ok = towerStartRemote(floor)
+        local started = waitForStart()
+        print(string.format("[NEXUS] towerStart smart: floor=%d invoke=%s started=%s", floor, tostring(ok), tostring(started)))
+        if started then
             return true, floor
         end
     end
@@ -501,7 +518,7 @@ local function runSendTower()
     while hubAlive() and flags.sendTower do
         local v = vitals()
         if (v.health or 1) >= 0.999 and not (flags.rebirthFarm and rebirthReady()) then
-            task.spawn(function() pcallInvoke(R.TowerStart, towerStartFloor()) end)
+            task.spawn(function() towerStartRemote(towerStartFloor()) end)
             task.wait(2.5)
         end
         task.wait(0.7)
@@ -526,6 +543,7 @@ end
 -- TowerContinueDecline remote the game's own "No thanks" button sends, so it
 -- is refused without paying to continue the run.
 local rfContinueConn = nil
+local towerStartBusy = false
 local function runRebirthFarm()
     if not rfContinueConn then
         rfContinueConn = Remotes.onClient(R.TowerContinueOffer, function()
@@ -586,9 +604,11 @@ local function runRebirthFarm()
                 task.wait(3)
             end
         else
-            if atCorral() and (vitals().health or 1) >= 0.999 then
+            if atCorral() and (vitals().health or 1) >= 0.999 and not towerStartBusy then
+                towerStartBusy = true
                 task.spawn(function()
-                    towerStartSmart()
+                    pcall(function() towerStartSmart() end)
+                    towerStartBusy = false
                 end)
             end
         end
@@ -1290,5 +1310,124 @@ if flags.performance then applyPerformance(true) end
 if flags.ultraPerformance then applyUltraPerformance(true) end
 if flags.autoReconnect then task.spawn(runAutoReconnect) end
 if flags.autoLoadOnTeleport then task.spawn(runQueueKeepAlive) end
+
+-- ------------------------------------------------------------------
+-- LIVE STAT TRACKER overlay
+-- A small draggable on-screen panel that reads live stats straight from
+-- the client memory (client:get snapshots) and updates them in a loop,
+-- without affecting gameplay.
+-- ------------------------------------------------------------------
+local statGui = nil
+local statLabels = {}
+local statShow = false
+local UserInputService = game:GetService("UserInputService")
+local function towerData()
+    local ok, t = pcall(function() return client:get({ "tower" }) end)
+    return (ok and type(t) == "table") and t or {}
+end
+
+local function buildStatGui()
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "NEXUSStatTracker"
+    sg.ResetOnSpawn = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = Player.PlayerGui
+
+    local bg = Instance.new("Frame")
+    bg.Name = "Panel"
+    bg.Size = UDim2.fromOffset(210, 150)
+    bg.Position = UDim2.new(0, 12, 1, -162)
+    bg.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+    bg.BackgroundTransparency = 0.15
+    bg.BorderSizePixel = 0
+    bg.Parent = sg
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 24)
+    title.BackgroundColor3 = Color3.fromRGB(40, 40, 58)
+    title.BackgroundTransparency = 0.4
+    title.Font = Enum.Font.GothamBold
+    title.Text = "LIVE STATS"
+    title.TextSize = 14
+    title.TextColor3 = Color3.fromRGB(255, 220, 120)
+    title.Parent = bg
+
+    -- make the panel draggable from its title bar
+    local dragging, dragOff = false, Vector2.new()
+    title.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging, dragOff = true, inp.Position - bg.AbsolutePosition
+        end
+    end)
+    title.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+    game:GetService("RunService").RenderStepped:Connect(function()
+        if dragging then
+            local vp = game:GetService("GuiService"):GetScreenResolution()
+            local mouse = UserInputService:GetMouseLocation()
+            bg.Position = UDim2.fromOffset(
+                math.clamp(mouse.X - dragOff.X, 0, vp.X),
+                math.clamp(mouse.Y - dragOff.Y, 0, vp.Y)
+            )
+        end
+    end)
+
+    local function rowLabel(y)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -12, 0, 20)
+        lbl.Position = UDim2.new(0, 6, 0, y)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 13
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.TextColor3 = Color3.fromRGB(230, 230, 240)
+        lbl.Parent = bg
+        return lbl
+    end
+
+    statLabels.best = rowLabel(30)
+    statLabels.peak = rowLabel(52)
+    statLabels.time = rowLabel(74)
+    statLabels.rebirth = rowLabel(96)
+    statLabels.money = rowLabel(118)
+
+    sg.Enabled = statShow
+    statGui = sg
+end
+
+-- continuous updater: reads client memory and paints the labels
+local function runStatTracker()
+    while hubAlive() do
+        if statShow and statGui and statGui.Enabled then
+            local t = towerData()
+            local rb = rebirthCount()
+            local m = money()
+            statLabels.best.Text = string.format("Best floor   %s", tostring(t.best or "—"))
+            statLabels.peak.Text = string.format("Peak floor   %s", tostring(t.peak or "—"))
+            local bt = t.bestTime
+            statLabels.time.Text = string.format("Best time    %s", (type(bt) == "number") and (string.format("%.2fs", bt)) or "—")
+            statLabels.rebirth.Text = string.format("Rebirths     %s", tostring(rb or 0))
+            statLabels.money.Text = string.format("Money        %s", tostring(m or 0))
+        end
+        task.wait(0.5)
+    end
+end
+
+-- toggle in the Misc/Utilities section
+tabs.misc:CreateToggle({
+    Name = "Live Stats Tracker",
+    Default = false,
+    Callback = function(v)
+        statShow = v
+        if v then
+            if not statGui then buildStatGui() end
+            statGui.Enabled = true
+            task.spawn(runStatTracker)
+        else
+            if statGui then statGui.Enabled = false end
+        end
+    end,
+})
 
 getgenv().NX_HUB = true
