@@ -51,6 +51,31 @@ local function hubAlive()
 end
 
 ------------------------------------------------------------------
+-- Window de-dup guard.
+-- Every execution must result in exactly ONE hub window. Rejoins run the
+-- script through plain loadstring (queue_on_teleport / autoload), where
+-- Real's STATE/live-reload teardown is NOT available, so each rejoin used to
+-- stack a fresh Rayfield window on top of every previous one. Fix: before we
+-- ever build a window, sweep CoreGui and hard-destroy EVERY existing "NEXUS
+-- HUB" window (and Rayfield's notification shell). This runs no matter how
+-- the script was launched, so old windows can never survive a new execution.
+local function killAllNexusWindows()
+    for _, sg in ipairs(game:GetService("CoreGui"):GetDescendants()) do
+        if sg:IsA("ScreenGui") or sg:IsA("LayerCollector") then
+            pcall(function()
+                if sg:FindFirstChild("NEXUS HUB") or sg.Name == "Notifications" then
+                    sg:Destroy()
+                end
+            end)
+        end
+    end
+end
+
+-- Registry so an in-session re-run can also tear down the current window the
+-- moment a newer instance takes over.
+getgenv().NexusHubWin = nil
+
+------------------------------------------------------------------
 -- Config
 ------------------------------------------------------------------
 local flags = {
@@ -64,6 +89,8 @@ local flags = {
     upgradeRecycler = false,
     autoClaimEggIncubator = false,
     autoUpgradeIncubator = false,
+    autoCollectEggs = false,   -- walk to world egg drops (NestEggs) to collect them
+    collectEggRadius = 200,    -- max scan distance (studs) for world egg drops
     autoFuse = false,
     autoSell = false,
     autoArena = false,
@@ -211,6 +238,27 @@ local function queueHubReload()
     end
 end
 
+-- Keep-alive: while the hub is alive and Auto Load on Teleport is on, re-queue
+-- our reload on a timer. queue_on_teleport holds only ONE source (last writer
+-- wins), and other hubs (e.g. Apel) overwrite it. Re-queuing every few seconds
+-- makes sure the Nexus hub is the one that runs after a teleport/rejoin.
+-- Cheap: just a readfile + set of a string.
+-- A generation token keeps only ONE keep-alive alive: each call bumps the
+-- token, so any prior loop (still sleeping in task.wait) dies on its next
+-- iteration instead of stacking a second, redundant re-queuer.
+local queueKeepAliveGen = 0
+local function runQueueKeepAlive()
+    if not flags.autoLoadOnTeleport then return end
+    local myGen = queueKeepAliveGen + 1
+    queueKeepAliveGen = myGen
+    task.spawn(function()
+        while hubAlive() and flags.autoLoadOnTeleport and queueKeepAliveGen == myGen do
+            queueHubReload()
+            task.wait(4)
+        end
+    end)
+end
+
 -- Teleport to a specific server (jobId). Same-place hop within this game.
 local function hopToJob(jobId)
     if not jobId or jobId == "" then return false end
@@ -257,12 +305,7 @@ end
 -- Auto Reconnect: when enabled, if we get kicked or removed from the server,
 -- teleport straight back into the same server (Auto Load on Teleport reloads
 -- the hub on arrival). Watches LocalPlayer's Parent — a kick sets it to nil.
-local reconnectConn = nil
 local function runAutoReconnect()
-    if reconnectConn then
-        pcall(function() reconnectConn:Disconnect() end)
-        reconnectConn = nil
-    end
     local reconnectToken = { armed = false }
     local function tryReconnect()
         if not (hubAlive() and flags.autoReconnect) then return end
@@ -288,7 +331,6 @@ local function runAutoReconnect()
     end
     pcall(function() changedConn:Disconnect() end)
     pcall(function() removingConn:Disconnect() end)
-    reconnectConn = nil
 end
 
 ------------------------------------------------------------------
@@ -535,6 +577,122 @@ local function runAutoClaimEggIncubator()
             task.wait(1.0)
         end
         task.wait(5.0)
+    end
+end
+
+-- Auto Collect Nest Eggs: collect the player's world egg drops under
+-- Workspace.NestEggs by gliding the character onto each egg so the server
+-- (proximity/touch based) picks it up. Eggs are server-owned and anchored, so
+-- there is no "pull the egg to me" magnet and no collect remote — the character
+-- must physically reach the egg's server position. To avoid the movement guard
+-- (flags any frame moving >8 studs, 3 strikes = disconnect), we GLIDE: step the
+-- root toward the egg in small Heartbeat increments, always well under the cap,
+-- so it snaps to each egg near-instantly without a visible walk and without a
+-- kick. Continuously rescans so eggs that drop after the chicken's lay-countdown
+-- are caught as soon as they appear.
+local scanEggGap = 0.5   -- seconds between egg scans
+local SAFE_GLIDE = 18    -- studs/s sustained glide speed (under the 24/s speed cap)
+
+local function scanNestEggs(radius)
+    local out = {}
+    local NestEggs = Workspace:FindFirstChild("NestEggs")
+    local hrp = getCharRoot()
+    if not NestEggs or not hrp then return out end
+    local uid = Player and Player.UserId
+    for _, v in ipairs(NestEggs:GetChildren()) do
+        if v:IsA("BasePart") and v.Parent then
+            local owner = v:GetAttribute("owner")
+            if (owner == nil or owner == uid) and (v.Position - hrp.Position).Magnitude <= radius then
+                table.insert(out, v)
+            end
+        end
+    end
+    return out
+end
+
+-- Glide the root part to a target at a safe sustained speed. The movement guard
+-- flags (a) any frame moving >8 studs and (b) sustained speed above ~24 studs/s;
+-- both mean a fast "snap" or a long jump trips it and kicks. So we move the root
+-- by SAFE_GLIDE * dt each Heartbeat frame: ~18 studs/s. That is comfortably under
+-- BOTH the per-frame teleport cap and the sustained speed cap, so the collector
+-- visibly darts to each egg without ever triggering a strike.
+local function glideTo(target, reach)
+    local hrp = getCharRoot()
+    local hum = Player.Character and Player.Character:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return false end
+    -- cancel any MoveTo the player is doing so the root isn't fought
+    pcall(function() hum:MoveTo(hrp.Position) end)
+    if (target - hrp.Position).Magnitude <= reach then return true end
+    local budget = 20
+    while hubAlive() and budget > 0 do
+        local root = getCharRoot()
+        if not root then return false end
+        local toGo = target - root.Position
+        local dist = toGo.Magnitude
+        if dist <= reach then
+            root.CFrame = CFrame.new(target)
+            return true
+        end
+        local dt = RunService.Heartbeat:Wait()
+        budget = budget - dt
+        root.CFrame = root.CFrame + toGo.Unit * (SAFE_GLIDE * dt)
+    end
+    return false
+end
+
+-- Locate the local player's own chicken body in the world. With Auto Pet on
+-- the chicken stays *still* in corral state, so its position is a stable egg
+-- spawn point; we return its part so we can anchor the character on it.
+local function myChickenBody()
+    local cb = Workspace:FindFirstChild("ChickenBodies")
+    if not cb then return nil end
+    local uid = Player and Player.UserId
+    for _, c in ipairs(cb:GetChildren()) do
+        if c:IsA("BasePart") and c:GetAttribute("ovOwner") == uid then
+            return c
+        end
+    end
+    return nil
+end
+
+-- Glue the character beside the player's own chicken so every egg is caught the
+-- instant it drops. The server collects when the player is within ~7 studs
+-- horizontally of the egg, so we keep the root horizontally aligned with the
+-- chicken (leaving Y to gravity) and re-anchor the moment it relocates (Auto
+-- Pet makes it hold still most of the time, but the server can walk/teleport it
+-- around the coop, so we follow). Falls back to scanning the world for owned
+-- eggs if no chicken body is tracked.
+local function runAutoCollectEggs()
+    while hubAlive() and flags.autoCollectEggs do
+        local chick = myChickenBody()
+        if chick and chick.Parent then
+            -- Stand beside the chicken (within the ~7-stud horizontal radius).
+            -- We only correct the horizontal plane and leave Y to gravity, so
+            -- the character doesn't bounce up and down trying to hover.
+            local hrp = getCharRoot()
+            if hrp then
+                local soglia = Vector3.new(chick.Position.X, hrp.Position.Y, chick.Position.Z)
+                local flat = Vector3.new(soglia.X - hrp.Position.X, 0, soglia.Z - hrp.Position.Z)
+                -- Re-anchor once we drift off the egg spawn point; the glide
+                -- keeps the character's Y so it stays grounded.
+                if flat.Magnitude > 2.5 then
+                    glideTo(soglia, 1.0)
+                end
+            end
+        else
+            -- No tracked chicken: fall back to scanning the world for owned eggs.
+            local hrp = getCharRoot()
+            if hrp then
+                local list = scanNestEggs(flags.collectEggRadius)
+                for _, egg in ipairs(list) do
+                    if not hubAlive() then break end
+                    if not egg.Parent then continue end
+                    glideTo(egg.Position, 2)
+                    task.wait(0.3)
+                end
+            end
+        end
+        task.wait(scanEggGap)
     end
 end
 
@@ -811,13 +969,12 @@ end
 -- Ultra Performance Mode: turns 3D rendering off entirely for maximum fps, and
 -- instead of the default blank view it shows a full black screen (via a
 -- full-screen black overlay, so it is not white). Also applies the lighter
--- Performance trims, drops the graphics quality level and disables particles.
+-- Performance trims and disables particles.
 local ultraOverlay = nil
 local function applyUltraPerformance(on)
     applyPerformance(on)
     if on then
         pcall(function() RunService:Set3dRenderingEnabled(false) end)
-        pcall(function() settings():GetService("QualitySettings").QualityLevel = 1 end)
         pcall(function()
             for _, p in ipairs(Lighting:GetDescendants()) do
                 if p:IsA("ParticleEmitter") or p:IsA("Beam") then
@@ -841,7 +998,6 @@ local function applyUltraPerformance(on)
         end
     else
         pcall(function() RunService:Set3dRenderingEnabled(true) end)
-        pcall(function() settings():GetService("QualitySettings").QualityLevel = 10 end)
         if ultraOverlay then
             pcall(function() ultraOverlay:Destroy() end)
             ultraOverlay = nil
@@ -852,6 +1008,9 @@ end
 ------------------------------------------------------------------
 -- UI build
 ------------------------------------------------------------------
+-- Hard clear any hub windows left over from earlier executions (rejoins,
+-- crash leftovers, queued reloads) so only ONE ever exists.
+killAllNexusWindows()
 local win = Rayfield:CreateWindow({
     Name = "NEXUS HUB",
     Subtitle = "Grow a Chicken Fighter",
@@ -862,13 +1021,16 @@ local win = Rayfield:CreateWindow({
     KeySystem = false,
     ToggleUIKeybind = Enum.KeyCode.LeftControl,
 })
+getgenv().NexusHubWin = win
 
 -- on reload, tear down the previous run's window so windows don't stack
 if STATE then
     STATE.onCleanup(function()
+        pcall(function() if win then win:Unload() end end)
+        killAllNexusWindows()
         pcall(function() if ultraOverlay then ultraOverlay:Destroy() end end)
         pcall(function() RunService:Set3dRenderingEnabled(true) end)
-        pcall(function() if win then win:Unload() end end)
+        getgenv().NexusHubWin = nil
     end)
 end
 
@@ -883,6 +1045,7 @@ local toggles = {
     { "farm",   "Farming",    "Auto Buy Feeder",            "buyFeeder",              runBuyFeeder },
     { "farm",   "Farming",    "Auto Upgrade Coop",          "upgradeCoop",            runUpgradeCoop },
     { "farm",   "Farming",    "Auto Claim Egg Incubator",   "autoClaimEggIncubator",  runAutoClaimEggIncubator },
+    { "farm",   "Farming",    "Auto Collect Eggs (walk)",   "autoCollectEggs",        runAutoCollectEggs },
     { "farm",   "Farming",    "Auto Upgrade Incubator",     "autoUpgradeIncubator",   runAutoUpgradeIncubator },
     { "farm",   "Farming",    "Auto Upgrade Recycler",      "upgradeRecycler",        runUpgradeRecycler },
     { "farm",   "Farming",    "Auto Pet",                   "autoPet",                runAutoPet },
@@ -913,7 +1076,6 @@ local tabs = {
     misc = win:CreateTab({ Name = "Misc", Icon = "settings" }),
     fight = win:CreateTab({ Name = "Fighting", Icon = "sword" }),
     server = win:CreateTab({ Name = "Server", Icon = "globe" }),
-    config = win:CreateTab({ Name = "Config", Icon = "settings" }),
 }
 
 local sections = {} -- tabKey -> sectionName -> section element (reused, created once)
@@ -956,6 +1118,18 @@ tabs.farm:CreateDropdown({
     end,
 })
 
+-- Farm: how far to scan for world egg drops when Auto Collect Eggs is on
+tabs.farm:CreateSlider({
+    Name = "Collect Egg Scan Radius",
+    Range = { 30, 500 },
+    Increment = 10,
+    Suffix = " studs",
+    CurrentValue = flags.collectEggRadius or 200,
+    Callback = function(v)
+        flags.collectEggRadius = v
+    end,
+})
+
 -- Misc / Utilities: the two performance toggles are immediate effects, not loops
 tabs.misc:CreateToggle({
     Name = "Performance Mode",
@@ -985,14 +1159,15 @@ tabs.misc:CreateButton({
         -- restore rendering + remove the black overlay if it was on
         pcall(function() RunService:Set3dRenderingEnabled(true) end)
         pcall(function() if ultraOverlay then ultraOverlay:Destroy() end end)
-        -- destroy the GUI
+        -- destroy the GUI (and any leftover hub windows)
         pcall(function() if win then win:Unload() end end)
+        killAllNexusWindows()
+        getgenv().NexusHubWin = nil
         getgenv().NX_HUB = nil
     end,
 })
 
--- Config tab: placeholder only (nothing configurable yet)
-tabs.config:CreateSection({ Name = "Config" })
+-- Config tab: removed (config auto save / load disabled)
 
 -- Server tab: same-place server hopping + rejoin
 tabs.server:CreateSection({ Name = "Server" })
@@ -1019,6 +1194,7 @@ tabs.server:CreateToggle({
     Default = flags.autoLoadOnTeleport == true,
     Callback = function(v)
         flags.autoLoadOnTeleport = v
+        if v then task.spawn(runQueueKeepAlive) end
     end,
 })
 tabs.server:CreateToggle({
@@ -1034,5 +1210,6 @@ tabs.server:CreateToggle({
 if flags.performance then applyPerformance(true) end
 if flags.ultraPerformance then applyUltraPerformance(true) end
 if flags.autoReconnect then task.spawn(runAutoReconnect) end
+if flags.autoLoadOnTeleport then task.spawn(runQueueKeepAlive) end
 
 getgenv().NX_HUB = true
