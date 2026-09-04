@@ -438,25 +438,34 @@ local function towerStartFloor()
     end
 end
 
+-- Wait up to ~3s for the chicken to actually leave the corral after a tower
+-- start, i.e. confirm the run really began on the floor we picked. Returns
+-- true once the chicken is no longer resting at the corral.
+local function waitForStart()
+    for _ = 1, 6 do
+        if not atCorral() then return true end
+        task.wait(0.5)
+    end
+    return false
+end
+
 -- Smart tower start used by Rebirth Farm. Always try the highest reachable
 -- (frontier) floor first; if that fails to fire, step down to warm-up
 -- (frontier minus a small offset), and if that also fails, start at floor 1.
--- Each attempt is fired and then given a beat to actually take hold: the
--- chicken only counts as started once it leaves the corral, so the next
--- candidate is only tried when the previous one clearly didn't start. This
--- avoids firing all three back-to-back (which makes the server honor only
--- the last one, i.e. floor 1).
+-- Each attempt is fired and then we WAIT for the chicken to actually leave
+-- the corral (confirming the run started on that floor); only if it never
+-- leaves do we try the next candidate. This avoids firing all three
+-- back-to-back, which made the server honor only the last one (floor 1).
 local function towerStartSmart()
     if flags.towerStrategy == "bottom" then
-        return pcallInvoke(R.TowerStart, 1)
+        pcallInvoke(R.TowerStart, 1)
+        return waitForStart()
     end
     local front = Ladder.frontier(towerBest())
     local warm = math.max(1, front - TOWER_WARMUP_OFFSET)
     for _, floor in ipairs({ front, warm, 1 }) do
         pcallInvoke(R.TowerStart, floor)
-        task.wait(1.0)
-        if not atCorral() then
-            -- chicken left the corral -> a tower run actually started
+        if waitForStart() then
             return true, floor
         end
     end
@@ -546,25 +555,33 @@ local function runRebirthFarm()
         end
     end)
     -- Tower + rebirth loop: slower paced, independent of the feeder loop.
-    -- Fires rebirth the instant the chicken retreats to the corral (the server
-    -- only requires being home + meeting the floor: no full-health wait).
+    -- State machine:
+    --   * meeting the rebirth requirement -> surrender the chicken home, then
+    --     rebirth once it is resting at the corral.
+    --   * not yet meeting it -> START A RUN ONLY when the chicken is resting
+    --     at the corral AND back at full health, so it always waits until it
+    --     has fully recovered before heading to the tower again. While the
+    --     chicken is out fighting (not at the corral) the gate blocks any
+    --     re-fire, so we never send it straight back mid-transition.
     while hubAlive() and flags.rebirthFarm do
-        if rebirthReady() and not atCorral() then
-            pcallInvoke(R.TowerSurrender)
-            task.wait(1.0)
-        end
-        if rebirthReady() and atCorral() then
-            pcallInvoke(R.Rebirth)
-            task.wait(3)
-        end
-        if not rebirthReady() and (vitals().health or 1) >= 0.999 then
-            task.spawn(function()
-                if flags.towerStartSmart then
-                    towerStartSmart()
-                else
-                    pcallInvoke(R.TowerStart, towerStartFloor())
-                end
-            end)
+        if rebirthReady() then
+            if not atCorral() then
+                pcallInvoke(R.TowerSurrender)
+                task.wait(1.0)
+            elseif atCorral() then
+                pcallInvoke(R.Rebirth)
+                task.wait(3)
+            end
+        else
+            if atCorral() and (vitals().health or 1) >= 0.999 then
+                task.spawn(function()
+                    if flags.towerStartSmart then
+                        towerStartSmart()
+                    else
+                        pcallInvoke(R.TowerStart, towerStartFloor())
+                    end
+                end)
+            end
         end
         task.wait(0.6)
     end
