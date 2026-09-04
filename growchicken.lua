@@ -32,7 +32,6 @@ local FusionRules = require(ReplicatedStorage.Features.Chicken.FusionRules)
 local ChickenMode = require(Player.PlayerScripts.Features.Chicken.ChickenMode)
 local RebirthBonus = require(ReplicatedStorage.Core.Progression.RebirthBonus)
 local RebirthExperiment = require(ReplicatedStorage.Core.Progression.RebirthExperiment)
-local Ladder = require(ReplicatedStorage.Features.Battle.campaign.Ladder)
 
 -- Rayfield is shared globally so re-runs don't stack windows
 local Rayfield = getgenv().NexusRayfield
@@ -135,8 +134,13 @@ local function vitals()
     return { health = 1 }
 end
 
+local towerDebugOnce = false
 local function towerBest()
     local ok, t = pcall(function() return client:get({"tower"}) end)
+    if not towerDebugOnce then
+        towerDebugOnce = true
+        print("[NEXUS] raw tower data:", ok and t or t)
+    end
     if ok and t and t.best then return t.best end
     return 0
 end
@@ -411,14 +415,20 @@ local function runBuyFeeder()
     end
 end
 
--- Tower start-floor helper. The three Auto Farm tower strategies pick which
+-- Tower start-floor helpers. The three Auto Farm tower strategies pick which
 -- floor the run begins at:
 --   "bottom"   -> start from floor 1 (full fresh run)
---   "frontier" -> start at your current best (frontier)
+--   "frontier" -> start at the floor you'll challenge next (one above beaten best)
 --   "warmup"   -> start a few floors below the frontier to build up power
+-- The "Stats" spread the game/Apel shows is (Best 45 -> Frontier 46 -> Warm
+-- up 41), i.e. frontier is one above your beaten best floor.
 local TOWER_WARMUP_OFFSET = 5
+local function towerFrontier()
+    -- Highest challengeable floor: one above the beaten best.
+    return towerBest() + 1
+end
 local function towerStartFloor()
-    local front = Ladder.frontier(towerBest())
+    local front = towerFrontier()
     local s = flags.towerStrategy or "frontier"
     if s == "bottom" then
         return 1
@@ -452,7 +462,7 @@ local function towerStartSmart()
         pcallInvoke(R.TowerStart, 1)
         return waitForStart()
     end
-    local front = Ladder.frontier(towerBest())
+    local front = towerFrontier()
     local warm = math.max(1, front - TOWER_WARMUP_OFFSET)
     for _, floor in ipairs({ front, warm, 1 }) do
         pcallInvoke(R.TowerStart, floor)
