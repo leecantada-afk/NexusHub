@@ -1008,9 +1008,19 @@ end
 ------------------------------------------------------------------
 -- UI build
 ------------------------------------------------------------------
--- Hard clear any hub windows left over from earlier executions (rejoins,
--- crash leftovers, queued reloads) so only ONE ever exists.
+-- Hard clear any hub window left over from earlier executions (rejoins,
+-- crash leftovers, queued reloads) so only ONE ever exists. We MUST call
+-- Unload() on the previous window (not just destroy the GUI) so Rayfield
+-- drops its internal PageLayout/tab registry — otherwise the next re-deploy's
+-- CreateTab fails with "Rebirth Farm passed to PageLayout JumpTo is not part
+-- of the layout". This Unload also runs on plain-loadstring rejoins, where
+-- STATE.onCleanup never fires, which is the exact case that produced the bug.
+local prevWin = getgenv().NexusHubWin
+if prevWin then
+    pcall(function() prevWin:Unload() end)
+end
 killAllNexusWindows()
+getgenv().NexusHubWin = nil
 local win = Rayfield:CreateWindow({
     Name = "NEXUS HUB",
     Subtitle = "Grow a Chicken Fighter",
