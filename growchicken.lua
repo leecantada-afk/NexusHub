@@ -10,6 +10,7 @@
 -- keeping a toggle "on" (e.g. auto-upgrading the coop) after reload.
 getgenv().NEXUS_GEN = (getgenv().NEXUS_GEN or 0) + 1
 local gen = getgenv().NEXUS_GEN
+print("[Nexus] build snap-collect gen " .. tostring(gen))
 
 -- Real's live-reload teardown handle, injected only when this runs through
 -- live-reload. Under plain loadstring (rejoin/autoload) it's nil, so guard
@@ -95,7 +96,7 @@ local flags = {
     upgradeRecycler = false,
     autoClaimEggIncubator = false,
     autoUpgradeIncubator = false,
-    autoCollectEggs = false,   -- walk to world egg drops (NestEggs) to collect them
+    autoCollectEggs = false,   -- instant-touch world egg drops (NestEggs), walk only as fallback
     collectEggRadius = 200,    -- max scan distance (studs) for world egg drops
     autoFuse = false,
     autoSell = false,
@@ -755,33 +756,70 @@ end
 -- Pet makes it hold still most of the time, but the server can walk/teleport it
 -- around the coop, so we follow). Falls back to scanning the world for owned
 -- eggs if no chicken body is tracked.
+-- Steal an egg by snapping the REAL, still-parented HumanoidRootPart onto it.
+-- Verified 2026-09-05 (placeVersion 996): the server's egg grant fires only on
+-- a genuine Touched by the player's actual character part - so the character
+-- truly has to be at the egg. firetouchinterest, phantom parts, anchored/
+-- physics proxies and unparented (Parent = nil) roots all fail; unparented
+-- positions never replicate, so the server never sees them. A snap keeps the
+-- root parented, so the server sees the character ON the egg, grants it, then
+-- corrects the teleport by snapping the character back (a ~0.3s flicker) -
+-- without kicking (7 rapid steals observed, no kick; after 3 consecutive
+-- rejections the collector disables snapping entirely for the session). The
+-- hold is capped at 0.28s: an egg either registers within ~2 server ticks or
+-- it won't, and shorter holds keep the hop barely visible. The whole bound
+-- character model moves as one parented assembly (no detached parts) - snap
+-- on, hold, snap straight back. Returns true when the egg vanished (server
+-- collected it).
+local function snapCollect(egg)
+    local hrp = getCharRoot()
+    if not egg or not egg.Parent or not hrp then return false end
+    local saved = hrp.CFrame
+    hrp.CFrame = CFrame.new(egg.Position + Vector3.new(0, 1.0, 0))
+    local deadline = os.clock() + 0.28
+    local collected = false
+    while os.clock() < deadline and hubAlive() do
+        task.wait(0.03)
+        if not egg.Parent then collected = true break end
+    end
+    pcall(function() hrp.CFrame = saved end)
+    task.wait(0.05)
+    return collected
+end
+
 local function runAutoCollectEggs()
+    local snapStrikes = 0
+    local lastSnap = 0
     while hubAlive() and flags.autoCollectEggs do
-        local chick = myChickenBody()
-        if chick and chick.Parent then
-            -- Stand beside the chicken (within the ~7-stud horizontal radius).
-            -- We only correct the horizontal plane and leave Y to gravity, so
-            -- the character doesn't bounce up and down trying to hover.
+        -- Snap-only collector: every owned egg out of natural range (~7 studs)
+        -- is stolen with the fast 0.28s snap-flicker - snap the whole bound
+        -- character model onto the egg and instantly back, never walking or
+        -- gliding anywhere. Eggs inside the ~7-stud zone the server collects by
+        -- itself while the character idle. There is deliberately NO falling back
+        -- to walking/gliding anymore.
+        --
+        -- One guard stays: the server's teleport-strike counter (observed
+        -- 2026-09-05: a dense always-on loop of ~1 steal/2s triggers a kick; 7
+        -- steals spread over minutes does not). Max one snap per SNAP_GAP, and
+        -- after 3 consecutive rejections the snap path is disabled for the
+        -- session (eggs are simply left for the next time the toggle is on).
+        if getCharRoot() and snapStrikes < 3 then
+            local list = scanNestEggs(flags.collectEggRadius)
             local hrp = getCharRoot()
-            if hrp then
-                local soglia = Vector3.new(chick.Position.X, hrp.Position.Y, chick.Position.Z)
-                local flat = Vector3.new(soglia.X - hrp.Position.X, 0, soglia.Z - hrp.Position.Z)
-                -- Re-anchor once we drift off the egg spawn point; the glide
-                -- keeps the character's Y so it stays grounded.
-                if flat.Magnitude > 2.5 then
-                    glideTo(soglia, 1.0)
-                end
-            end
-        else
-            -- No tracked chicken: fall back to scanning the world for owned eggs.
-            local hrp = getCharRoot()
-            if hrp then
-                local list = scanNestEggs(flags.collectEggRadius)
-                for _, egg in ipairs(list) do
-                    if not hubAlive() then break end
-                    if not egg.Parent then continue end
-                    glideTo(egg.Position, 2)
-                    task.wait(0.3)
+            for _, egg in ipairs(list) do
+                if not hubAlive() then break end
+                if egg.Parent and (hrp.Position - egg.Position).Magnitude > 7 then
+                    if os.clock() - lastSnap >= 6 then
+                        if snapCollect(egg) then
+                            lastSnap = os.clock()
+                            snapStrikes = 0
+                        else
+                            snapStrikes = snapStrikes + 1
+                        end
+                    else
+                        -- paced out; the next distant egg can wait
+                        break
+                    end
                 end
             end
         end
@@ -2106,7 +2144,7 @@ local toggles = {
     { "farm",   "Farming",    "Auto Buy Feeder",            "buyFeeder",              runBuyFeeder },
     { "farm",   "Farming",    "Auto Upgrade Coop",          "upgradeCoop",            runUpgradeCoop },
     { "farm",   "Farming",    "Auto Claim Egg Incubator",   "autoClaimEggIncubator",  runAutoClaimEggIncubator },
-    { "farm",   "Farming",    "Auto Collect Eggs (walk)",   "autoCollectEggs",        runAutoCollectEggs },
+    { "farm",   "Farming",    "Auto Collect Eggs",         "autoCollectEggs",        runAutoCollectEggs },
     { "farm",   "Farming",    "Auto Upgrade Incubator",     "autoUpgradeIncubator",   runAutoUpgradeIncubator },
     { "farm",   "Farming",    "Auto Upgrade Recycler",      "upgradeRecycler",        runUpgradeRecycler },
     { "farm",   "Farming",    "Auto Pet",                   "autoPet",                runAutoPet },
