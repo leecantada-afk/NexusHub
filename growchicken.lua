@@ -11,6 +11,11 @@
 getgenv().NEXUS_GEN = (getgenv().NEXUS_GEN or 0) + 1
 local gen = getgenv().NEXUS_GEN
 
+-- Real's live-reload teardown handle, injected only when this runs through
+-- live-reload. Under plain loadstring (rejoin/autoload) it's nil, so guard
+-- every use. Read via getgenv so the static checker doesn't flag a global.
+local STATE = getgenv().STATE
+
 ------------------------------------------------------------------
 -- Services & requires
 ------------------------------------------------------------------
@@ -20,6 +25,7 @@ local Lighting = game:GetService("Lighting")
 
 local Player = Players.LocalPlayer
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 local Packages = ReplicatedStorage:FindFirstChild("Packages") or ReplicatedStorage:WaitForChild("Packages")
 local client = require(Packages.DataService).client
 local Remotes = require(ReplicatedStorage.Core.Remotes)
@@ -32,13 +38,6 @@ local FusionRules = require(ReplicatedStorage.Features.Chicken.FusionRules)
 local ChickenMode = require(Player.PlayerScripts.Features.Chicken.ChickenMode)
 local RebirthBonus = require(ReplicatedStorage.Core.Progression.RebirthBonus)
 local RebirthExperiment = require(ReplicatedStorage.Core.Progression.RebirthExperiment)
-
--- Rayfield is shared globally so re-runs don't stack windows
-local Rayfield = getgenv().NexusRayfield
-if not Rayfield then
-    Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
-    getgenv().NexusRayfield = Rayfield
-end
 
 local inv = Remotes.invoke
 local R = Remotes.defs
@@ -58,11 +57,19 @@ end
 -- ever build a window, sweep CoreGui and hard-destroy EVERY existing "NEXUS
 -- HUB" window (and Rayfield's notification shell). This runs no matter how
 -- the script was launched, so old windows can never survive a new execution.
-local function killAllNexusWindows()
+-- Sweep every hub window except the CURRENT generation's own. Windows get a
+-- "NX_GEN" attribute stamped with the generation that built them, so a sweep
+-- from any (possibly stale) copy can never destroy the live window: a stale
+-- instance has an older gen and dies, a re-entrant sweep sees the current gen
+-- and skips it. Pass force=true (the Unload button) to take everything down.
+local function killAllNexusWindows(force)
+    local myGen = getgenv().NEXUS_GEN
     for _, sg in ipairs(game:GetService("CoreGui"):GetDescendants()) do
         if sg:IsA("ScreenGui") or sg:IsA("LayerCollector") then
             pcall(function()
-                if sg:FindFirstChild("NEXUS HUB") or sg.Name == "Notifications" then
+                local ours = sg:FindFirstChild("NEXUS HUB") or sg.Name == "Notifications" or sg.Name == "NexusHubUI"
+                local sgGen = sg:GetAttribute("NX_GEN") or 0
+                if ours and (force or sgGen < myGen) then
                     sg:Destroy()
                 end
             end)
@@ -107,7 +114,7 @@ local flags = {
     autoReconnect = false,
 }
 
-------------------------------------------------------------------
+-----------------------------------------------------------------
 -- Shared helpers
 ------------------------------------------------------------------
 local function money()
@@ -243,9 +250,9 @@ end
 -- Teleport is enabled. Reads the canonical source from the workspace copy.
 local function queueHubReload()
     if not flags.autoLoadOnTeleport then return end
-    local ok, src = pcall(readfile, "nexus_hub_reload.luau")
+    local ok, src = pcall(readfile, "nexus_hub_v2.luau")
     if ok and type(src) == "string" then
-        pcall(queue_on_teleport, "loadstring(readfile('nexus_hub_reload.luau'))()")
+        pcall(queue_on_teleport, "loadstring(readfile('nexus_hub_v2.luau'))()")
     end
 end
 
@@ -492,9 +499,8 @@ local function towerStartSmart()
     local front = towerFrontier()
     local warm = math.max(1, front - TOWER_WARMUP_OFFSET)
     for _, floor in ipairs({ front, warm, 1 }) do
-        local ok = towerStartRemote(floor)
+        towerStartRemote(floor)
         local started = waitForStart()
-        print(string.format("[NEXUS] towerStart smart: floor=%d invoke=%s started=%s", floor, tostring(ok), tostring(started)))
         if started then
             return true, floor
         end
@@ -1093,41 +1099,997 @@ local function applyUltraPerformance(on)
 end
 
 ------------------------------------------------------------------
--- UI build
+-- UI build — custom gold/silver window (no Rayfield)
 ------------------------------------------------------------------
 -- Hard clear any hub window left over from earlier executions (rejoins,
--- crash leftovers, queued reloads) so only ONE ever exists. We MUST call
--- Unload() on the previous window (not just destroy the GUI) so Rayfield
--- drops its internal PageLayout/tab registry — otherwise the next re-deploy's
--- CreateTab fails with "Rebirth Farm passed to PageLayout JumpTo is not part
--- of the layout". This Unload also runs on plain-loadstring rejoins, where
--- STATE.onCleanup never fires, which is the exact case that produced the bug.
-local prevWin = getgenv().NexusHubWin
-if prevWin then
-    pcall(function() prevWin:Unload() end)
-end
+-- crash leftovers, queued reloads) so only ONE ever exists. Every execution
+-- rebuilds a single ScreenGui; the guard sweeps CoreGui for our own name plus
+-- any Rayfield leftovers, which also covers plain-loadstring rejoins where
+-- STATE.onCleanup never fires.
 killAllNexusWindows()
 getgenv().NexusHubWin = nil
-local win = Rayfield:CreateWindow({
-    Name = "NEXUS HUB",
-    Subtitle = "Grow a Chicken Fighter",
-    LoadingTitle = "NEXUS HUB",
-    LoadingSubtitle = "by Real",
-    ConfigurationSaving = { Enabled = false, FolderName = "NexusHub", FileName = "settings" },
-    Discord = { Enabled = false },
-    KeySystem = false,
-    ToggleUIKeybind = Enum.KeyCode.LeftControl,
-})
-getgenv().NexusHubWin = win
 
--- on reload, tear down the previous run's window so windows don't stack
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local TweenService = game:GetService("TweenService")
+
+local T = {
+    bg      = Color3.fromRGB(17, 17, 25),
+    panel   = Color3.fromRGB(26, 26, 38),
+    panel2  = Color3.fromRGB(33, 33, 48),
+    sidebar = Color3.fromRGB(20, 20, 29),
+    gold    = Color3.fromRGB(255, 203, 96),
+    goldLo  = Color3.fromRGB(150, 118, 55),
+    text    = Color3.fromRGB(236, 236, 244),
+    textDim = Color3.fromRGB(153, 153, 171),
+    red     = Color3.fromRGB(235, 84, 84),
+    yellow  = Color3.fromRGB(232, 190, 66),
+    green   = Color3.fromRGB(96, 214, 138),
+}
+
+local function mk(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do inst[k] = v end
+    if parent ~= nil then inst.Parent = parent end
+    return inst
+end
+
+local function rounded(obj, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r)
+    c.Parent = obj
+end
+
+-- ---------------- root + bubble + window ----------------
+local sg = mk("ScreenGui", {
+    Name = "NexusHubUI",
+    DisplayOrder = 999,
+    IgnoreGuiInset = true,
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    Parent = game:GetService("CoreGui"),
+})
+sg:SetAttribute("NX_GEN", gen)
+getgenv().NexusHubWin = sg
+
+local bubble = mk("TextButton", {
+    Name = "Bubble",
+    Size = UDim2.fromOffset(58, 58),
+    Position = UDim2.new(1, -82, 1, -82),
+    BackgroundColor3 = T.gold,
+    BorderSizePixel = 0,
+    Text = "N",
+    Font = Enum.Font.GothamBold,
+    TextSize = 24,
+    TextColor3 = Color3.fromRGB(22, 22, 28),
+    AutoButtonColor = false,
+    ZIndex = 5,
+    Parent = sg,
+})
+rounded(bubble, 29)
+mk("UIStroke", { Color = T.goldLo, Thickness = 2, Transparency = 0.45, Parent = bubble })
+
+local windowFrame = mk("Frame", {
+    Name = "Window",
+    Size = UDim2.fromOffset(750, 480),
+    Position = UDim2.new(0.5, -375, 0.5, -240),
+    BackgroundColor3 = Color3.fromRGB(24, 26, 40),
+    BackgroundTransparency = 0.3,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 6,
+    Parent = sg,
+})
+rounded(windowFrame, 12)
+mk("UIStroke", { Color = T.goldLo, Thickness = 1, Transparency = 0.5, Parent = windowFrame })
+-- translucent glass: edges feather out (more transparent), the middle stays
+-- readable. Composite alpha = (1 - 0.3) * (1 - gradient) per pixel.
+mk("UIGradient", {
+    Rotation = 90,
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.55),
+        NumberSequenceKeypoint.new(0.45, 0.14),
+        NumberSequenceKeypoint.new(0.55, 0.14),
+        NumberSequenceKeypoint.new(1, 0.55),
+    }),
+    Parent = windowFrame,
+})
+
+-- Window open/close is animated with a short TweenService zoom so the hub
+-- never just cuts in/out: the frame shrinks about its own center while closing
+-- and grows back out on reopen, then is re-hidden once the tween finishes. No
+-- GroupTransparency — this client's Frame does not expose it. Size/Position
+-- are tweened between UDim2s computed arithmetically from the screen size so
+-- the center is always preserved and there are no stale Absolute* reads.
+local windowVisible = true
+local windowTween = nil
+local winRestore = nil -- { size, pos } (UDim2) captured on close, restored on reopen
+
+local function scrSize()
+    local s = GuiService:GetScreenResolution()
+    return s.X, s.Y
+end
+
+local function absX(ud, W) return ud.X.Scale * W + ud.X.Offset end
+local function absY(ud, H) return ud.Y.Scale * H + ud.Y.Offset end
+
+-- Two UDim2s (size, pos) of a rect scaled by f about its center, as absolute
+-- offsets. windowFrame's parent is the full-screen ScreenGui (anchor 0,0), so
+-- Position = screen offset directly.
+local function scaledAboutCenter(sizeUD, posUD, f, W, H)
+    local szx, szy = absX(sizeUD, W), absY(sizeUD, H)
+    local px, py = absX(posUD, W), absY(posUD, H)
+    local cx, cy = px + szx * 0.5, py + szy * 0.5
+    local mx, my = szx * f, szy * f
+    return UDim2.fromOffset(mx, my), UDim2.fromOffset(cx - mx * 0.5, cy - my * 0.5)
+end
+
+local function showWindow(open, animate)
+    if open == windowVisible then return end
+    windowVisible = open
+    if windowTween then
+        pcall(function() windowTween:Cancel() end)
+        windowTween = nil
+    end
+    if not animate then
+        windowFrame.Visible = open
+        return
+    end
+    local W, H = scrSize()
+    if open then
+        local goalSize = winRestore and winRestore.size or windowFrame.Size
+        local goalPos = winRestore and winRestore.pos or windowFrame.Position
+        winRestore = nil
+        -- normalize the goal to absolute offsets (a max'd window keeps scale),
+        -- then start small about its center and grow into it.
+        goalSize = UDim2.fromOffset(absX(goalSize, W), absY(goalSize, H))
+        goalPos = UDim2.fromOffset(absX(goalPos, W), absY(goalPos, H))
+        windowFrame.Visible = true
+        local startSize, startPos = scaledAboutCenter(goalSize, goalPos, 0.88, W, H)
+        windowFrame.Size = startSize
+        windowFrame.Position = startPos
+        windowTween = TweenService:Create(windowFrame,
+            TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Size = goalSize, Position = goalPos })
+        windowTween:Play()
+    else
+        winRestore = { size = windowFrame.Size, pos = windowFrame.Position }
+        -- normalize the current rect so the shrink starts from true offsets
+        local curS = UDim2.fromOffset(absX(windowFrame.Size, W), absY(windowFrame.Size, H))
+        local curP = UDim2.fromOffset(absX(windowFrame.Position, W), absY(windowFrame.Position, H))
+        windowFrame.Size = curS
+        windowFrame.Position = curP
+        local targetSize, targetPos = scaledAboutCenter(curS, curP, 0.86, W, H)
+        windowTween = TweenService:Create(windowFrame,
+            TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+            { Size = targetSize, Position = targetPos })
+        local tw = windowTween
+        tw.Completed:Connect(function()
+            if windowVisible == false then
+                windowFrame.Visible = false
+            end
+        end)
+        windowTween:Play()
+    end
+end
+
+-- ---------------- top bar ----------------
+local topbar = mk("Frame", {
+    Name = "TopBar",
+    Size = UDim2.new(1, 0, 0, 34),
+    BackgroundColor3 = T.panel,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 7,
+    Parent = windowFrame,
+})
+rounded(topbar, 12)
+
+local function dotButton(x, color)
+    local b = mk("TextButton", {
+        Name = "Dot",
+        Size = UDim2.fromOffset(13, 13),
+        Position = UDim2.new(0, x, 0.5, -7),
+        BackgroundColor3 = color,
+        BorderSizePixel = 0,
+        Text = "",
+        AutoButtonColor = false,
+        ZIndex = 10,
+        Parent = topbar,
+    })
+    rounded(b, 7)
+    return b
+end
+local closeBtn = dotButton(12, T.red)
+local minBtn = dotButton(32, T.yellow)
+local maxBtn = dotButton(52, T.green)
+
+mk("TextLabel", {
+    Name = "WinTitle",
+    Size = UDim2.new(1, -80, 0, 18),
+    Position = UDim2.new(0, 76, 0, 3),
+    BackgroundTransparency = 1,
+    Text = "NEXUS HUB",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = T.gold,
+    TextXAlignment = Enum.TextXAlignment.Center,
+    ZIndex = 8,
+    Parent = topbar,
+})
+mk("TextLabel", {
+    Name = "WinSub",
+    Size = UDim2.new(1, -80, 0, 12),
+    Position = UDim2.new(0, 76, 0, 20),
+    BackgroundTransparency = 1,
+    Text = "Grow a Chicken Fighter",
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextColor3 = T.textDim,
+    TextXAlignment = Enum.TextXAlignment.Center,
+    ZIndex = 8,
+    Parent = topbar,
+})
+
+-- window drag: a full-topbar invisible button so dragging works anywhere on
+-- the bar (the title labels above would otherwise swallow the input); the
+-- macOS dots sit above it so they stay clickable.
+local winDrag, winOff = false, Vector2.new()
+mk("TextButton", {
+    Name = "Drag",
+    Size = UDim2.new(1, 0, 0, 34),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Text = "",
+    ZIndex = 9,
+    Parent = topbar,
+}).InputBegan:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+        winDrag = true
+        winOff = UserInputService:GetMouseLocation() - windowFrame.AbsolutePosition
+    end
+end)
+
+-- macOS-style dots: red hides the window (bubble reopens), yellow hides too,
+-- green maximizes / restores the window.
+local winMax = false
+local winBaseSize = Vector2.new(750, 480)
+local winBasePos = UDim2.new(0.5, -375, 0.5, -240)
+closeBtn.MouseButton1Click:Connect(function() showWindow(false, true) end)
+minBtn.MouseButton1Click:Connect(function() showWindow(false, true) end)
+maxBtn.MouseButton1Click:Connect(function()
+    -- maximizing forces the window fully open, canceling any zoom mid-flight
+    if windowTween then
+        pcall(function() windowTween:Cancel() end)
+        windowTween = nil
+    end
+    windowVisible = true
+    windowFrame.Visible = true
+    winMax = not winMax
+    if winMax then
+        local vp = GuiService:GetScreenResolution()
+        local w, h = vp.X * 0.86, vp.Y * 0.86
+        windowFrame.Size = UDim2.fromOffset(w, h)
+        windowFrame.Position = UDim2.new(0.5, -w / 2, 0.5, -h / 2)
+    else
+        windowFrame.Size = UDim2.fromOffset(winBaseSize.X, winBaseSize.Y)
+        windowFrame.Position = winBasePos
+    end
+end)
+
+-- bubble: RIGHT-click toggles the window; LEFT-click / touch TAP toggles it
+-- too (unless it was a drag). Pressing the bubble also starts a drag so you
+-- can move it, and the drag is told apart from a tap by travel distance.
+bubble.MouseButton2Click:Connect(function()
+    showWindow(not windowVisible, true)
+end)
+
+local bubblePos0 = Vector2.new()
+local bubbleDrag, bubbleGrabMouse, bubbleGrabPos = false, Vector2.new(), UDim2.new()
+bubble.InputBegan:Connect(function(inp)
+    local t = inp.UserInputType
+    if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+        bubbleDrag = true
+        bubblePos0 = UserInputService:GetMouseLocation()
+        bubbleGrabMouse = bubblePos0
+        bubbleGrabPos = bubble.Position
+    end
+end)
+bubble.Activated:Connect(function()
+    if (UserInputService:GetMouseLocation() - bubblePos0).Magnitude > 12 then
+        return -- it was a drag, not a tap
+    end
+    showWindow(not windowVisible, true)
+end)
+
+-- any input release ends every drag
+UserInputService.InputEnded:Connect(function(inp)
+    local t = inp.UserInputType
+    if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+        bubbleDrag, winDrag = false, false
+    end
+end)
+
+-- keep bubble & window inside the viewport while dragging (clamped)
+RunService.RenderStepped:Connect(function()
+    local vp = GuiService:GetScreenResolution()
+    if bubbleDrag then
+        local m = UserInputService:GetMouseLocation()
+        bubble.Position = UDim2.new(
+            0, math.clamp(bubbleGrabPos.X.Offset + (m.X - bubbleGrabMouse.X), 0, vp.X - 58),
+            0, math.clamp(bubbleGrabPos.Y.Offset + (m.Y - bubbleGrabMouse.Y), 0, vp.Y - 58))
+    end
+    if winDrag and windowFrame.Visible then
+        local m = UserInputService:GetMouseLocation()
+        local sz = windowFrame.AbsoluteSize
+        windowFrame.Position = UDim2.fromOffset(
+            math.clamp(m.X - winOff.X, -sz.X + 90, vp.X - 90),
+            math.clamp(m.Y - winOff.Y, -sz.Y + 70, vp.Y - 70))
+    end
+end)
+
+-- LeftControl toggles the window too
+UserInputService.InputBegan:Connect(function(inp, gameProcessed)
+    if gameProcessed then return end
+    if inp.KeyCode == Enum.KeyCode.LeftControl then
+        showWindow(not windowVisible, true)
+    end
+end)
+
+-- ---------------- sidebar ----------------
+local sidebar = mk("Frame", {
+    Name = "Sidebar",
+    Position = UDim2.new(0, 0, 0, 34),
+    Size = UDim2.new(0, 190, 1, -34),
+    BackgroundColor3 = T.sidebar,
+    BackgroundTransparency = 0.24,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 7,
+    Parent = windowFrame,
+})
+rounded(sidebar, 12)
+
+mk("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 24),
+    Position = UDim2.new(0, 0, 0, 26),
+    BackgroundTransparency = 1,
+    Text = "NEXUS HUB",
+    Font = Enum.Font.GothamBold,
+    TextSize = 17,
+    TextColor3 = T.gold,
+    ZIndex = 8,
+    Parent = sidebar,
+})
+mk("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 14),
+    Position = UDim2.new(0, 0, 0, 50),
+    BackgroundTransparency = 1,
+    Text = "Grow a Chicken Fighter",
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextColor3 = T.textDim,
+    ZIndex = 8,
+    Parent = sidebar,
+})
+
+local tabOrder = {
+    { key = "home",   label = "Home" },
+    { key = "rfarm",  label = "Rebirth Farm" },
+    { key = "farm",   label = "Farm" },
+    { key = "misc",   label = "Misc" },
+    { key = "fight",  label = "Fighting" },
+    { key = "server", label = "Server" },
+}
+local tabBtns = {}
+local tabFrames = {}
+local activeTab = nil
+local syncCanvas -- forward declaration; defined below
+
+local tabList = mk("Frame", {
+    Name = "TabList",
+    Position = UDim2.new(0, 0, 0, 84),
+    Size = UDim2.new(1, 0, 1, -150),
+    BackgroundTransparency = 1,
+    ZIndex = 8,
+    Parent = sidebar,
+})
+local tabLayout = mk("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = tabList })
+tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+local function switchTab(key)
+    activeTab = key
+    for k, f in pairs(tabFrames) do f.Visible = (k == key) end
+    for k, b in pairs(tabBtns) do
+        local on = (k == key)
+        local accent = b:FindFirstChildOfClass("Frame")
+        b.BackgroundTransparency = on and 0 or 1
+        b.TextColor3 = on and T.text or T.textDim
+        if accent then accent.BackgroundTransparency = on and 0 or 1 end
+    end
+    pcall(syncCanvas)
+end
+
+for i, t in ipairs(tabOrder) do
+    local b = mk("TextButton", {
+        Name = "Tab_" .. t.key,
+        Size = UDim2.new(1, -22, 0, 34),
+        LayoutOrder = i,
+        BackgroundColor3 = T.panel2,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Text = t.label,
+        Font = Enum.Font.Gotham,
+        TextSize = 13,
+        TextColor3 = T.textDim,
+        AutoButtonColor = false,
+        ZIndex = 9,
+        Parent = tabList,
+    })
+    rounded(b, 17)
+    mk("Frame", {
+        Size = UDim2.fromOffset(3, 18),
+        Position = UDim2.new(0, 4, 0.5, -9),
+        BackgroundColor3 = T.gold,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 10,
+        Parent = b,
+    }) -- left accent bar, revealed when the tab is active
+    tabBtns[t.key] = b
+    b.MouseButton1Click:Connect(function() switchTab(t.key) end)
+end
+
+-- profile footer: local player's headshot thumbnail + display name
+local profile = mk("Frame", {
+    Name = "Profile",
+    Position = UDim2.new(0, 10, 1, -62),
+    Size = UDim2.new(1, -20, 0, 52),
+    BackgroundColor3 = T.panel,
+    BackgroundTransparency = 0.28,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 9,
+    Parent = sidebar,
+})
+rounded(profile, 26)
+
+local avId = Player and Player.UserId or 0
+local avatar = mk("ImageLabel", {
+    Name = "Avatar",
+    Size = UDim2.fromOffset(38, 38),
+    Position = UDim2.new(0, 7, 0.5, -19),
+    BackgroundColor3 = Color3.fromRGB(14, 14, 20),
+    BackgroundTransparency = 0.6,
+    Image = "rbxthumb://type=AvatarHeadShot&id=" .. avId .. "&w=150&h=150",
+    ScaleType = Enum.ScaleType.Crop,
+    ZIndex = 10,
+    Parent = profile,
+})
+rounded(avatar, 19)
+mk("UIStroke", { Color = T.gold, Thickness = 1, Transparency = 0.35, Parent = avatar })
+
+mk("TextLabel", {
+    Name = "DisplayName",
+    Size = UDim2.new(1, -54, 0, 18),
+    Position = UDim2.new(0, 52, 0, 7),
+    BackgroundTransparency = 1,
+    Text = Player and Player.DisplayName or "…",
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextColor3 = T.text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    ZIndex = 10,
+    Parent = profile,
+})
+mk("TextLabel", {
+    Name = "Username",
+    Size = UDim2.new(1, -54, 0, 14),
+    Position = UDim2.new(0, 52, 0, 28),
+    BackgroundTransparency = 1,
+    Text = Player and ("@" .. Player.Name) or "",
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextColor3 = T.textDim,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    ZIndex = 10,
+    Parent = profile,
+})
+
+-- ---------------- content ----------------
+local content = mk("ScrollingFrame", {
+    Name = "Content",
+    Position = UDim2.new(0, 190, 0, 34),
+    Size = UDim2.new(1, -190, 1, -34),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 4,
+    ScrollBarImageColor3 = T.goldLo,
+    CanvasSize = UDim2.fromOffset(0, 0),
+    ZIndex = 7,
+    Parent = windowFrame,
+})
+
+for _, t in ipairs(tabOrder) do
+    local f = mk("Frame", {
+        Name = "Page_" .. t.key,
+        Size = UDim2.new(1, -18, 0, 0),
+        Position = UDim2.fromOffset(0, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 8,
+        Visible = false,
+        Parent = content,
+    })
+    mk("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = f })
+    tabFrames[t.key] = f
+end
+
+-- keep the scroll canvas sized to whichever page is shown
+syncCanvas = function()
+    local page = tabFrames[activeTab]
+    if not page then return end
+    local lay = page:FindFirstChildOfClass("UIListLayout")
+    local h = lay and lay.AbsoluteContentSize.Y or 0
+    page.Size = UDim2.new(1, -18, 0, h)
+    content.CanvasSize = UDim2.fromOffset(0, h + 14)
+end
+task.spawn(function()
+    while hubAlive() and content do
+        pcall(syncCanvas)
+        task.wait(0.25)
+    end
+end)
+
+-- ---------------- component builders ----------------
+local orderFor = {}
+local function layoutOrder(page)
+    local o = (orderFor[page] or 0) + 1
+    orderFor[page] = o
+    return o
+end
+
+local function addSection(page, title)
+    return mk("TextLabel", {
+        Name = "Header",
+        Size = UDim2.new(1, -8, 0, 26),
+        BackgroundTransparency = 1,
+        Text = string.upper(title),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextColor3 = T.gold,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = layoutOrder(page),
+        ZIndex = 9,
+        Parent = page,
+    })
+end
+
+local function addToggle(page, name, flagKey, onChange, defaultOn)
+    local on = defaultOn
+    if on == nil then on = flags[flagKey] == true end
+    local row = mk("Frame", {
+        Name = "Row_" .. name,
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = T.panel,
+        BorderSizePixel = 0,
+        LayoutOrder = layoutOrder(page),
+        ZIndex = 9,
+        Parent = page,
+    })
+    rounded(row, 9)
+    local lbl = mk("TextLabel", {
+        Size = UDim2.new(1, -66, 0, 40),
+        BackgroundTransparency = 1,
+        Text = name,
+        Font = Enum.Font.Gotham,
+        TextSize = 13,
+        TextColor3 = T.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ZIndex = 10,
+        Parent = row,
+    })
+    local track = mk("Frame", {
+        Name = "Switch",
+        Size = UDim2.fromOffset(44, 24),
+        Position = UDim2.new(1, -56, 0.5, -12),
+        BackgroundColor3 = Color3.fromRGB(60, 60, 76),
+        BorderSizePixel = 0,
+        ZIndex = 11,
+        Parent = row,
+    })
+    rounded(track, 12)
+    local knob = mk("Frame", {
+        Name = "Knob",
+        Size = UDim2.fromOffset(18, 18),
+        Position = UDim2.new(0, 3, 0, 3),
+        BackgroundColor3 = Color3.fromRGB(240, 240, 240),
+        BorderSizePixel = 0,
+        ZIndex = 12,
+        Parent = track,
+    })
+    rounded(knob, 9)
+    local function paint()
+        track.BackgroundColor3 = on and T.gold or Color3.fromRGB(60, 60, 76)
+        knob.BackgroundColor3 = on and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(235, 235, 235)
+        knob.Position = on and UDim2.new(1, -21, 0, 3) or UDim2.new(0, 3, 0, 3)
+        lbl.TextColor3 = on and Color3.fromRGB(255, 255, 255) or T.text
+    end
+    local function flip()
+        on = not on
+        flags[flagKey] = on
+        paint()
+        if onChange then pcall(onChange, on) end
+    end
+    mk("TextButton", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Text = "",
+        ZIndex = 13,
+        Parent = row,
+    }).MouseButton1Click:Connect(flip)
+    paint()
+    return function() return on end
+end
+
+local function addDropdown(page, name, options, currentIndex, onChange)
+    local row = mk("Frame", {
+        Name = "Drop_" .. name,
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = T.panel,
+        BorderSizePixel = 0,
+        LayoutOrder = layoutOrder(page),
+        ZIndex = 9,
+        Parent = page,
+    })
+    rounded(row, 9)
+    mk("TextLabel", {
+        Size = UDim2.new(1, -176, 0, 40),
+        BackgroundTransparency = 1,
+        Text = name,
+        Font = Enum.Font.Gotham,
+        TextSize = 13,
+        TextColor3 = T.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ZIndex = 10,
+        Parent = row,
+    })
+    local box = mk("TextButton", {
+        Name = "Box",
+        Size = UDim2.fromOffset(168, 28),
+        Position = UDim2.new(1, -176, 0.5, -14),
+        BackgroundColor3 = T.panel2,
+        BorderSizePixel = 0,
+        Text = "",
+        AutoButtonColor = false,
+        ZIndex = 11,
+        Parent = row,
+    })
+    rounded(box, 7)
+    local boxText = mk("TextLabel", {
+        Size = UDim2.new(1, -22, 0, 28),
+        Position = UDim2.new(0, 8, 0, 0),
+        BackgroundTransparency = 1,
+        Text = tostring(options[currentIndex] or ""),
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextColor3 = T.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ZIndex = 12,
+        Parent = box,
+    })
+    mk("TextLabel", {
+        Size = UDim2.fromOffset(16, 28),
+        Position = UDim2.new(1, -18, 0, 0),
+        BackgroundTransparency = 1,
+        Text = "▾",
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = T.gold,
+        ZIndex = 12,
+        Parent = box,
+    })
+    local open = false
+    local popup = mk("Frame", {
+        Name = "Popup",
+        Size = UDim2.fromOffset(168, #options * 30),
+        Position = UDim2.new(1, -176, 0, 34),
+        BackgroundColor3 = T.panel2,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 30,
+        Parent = row,
+    })
+    rounded(popup, 7)
+    for i, opt in ipairs(options) do
+        mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 29),
+            Position = UDim2.new(0, 0, 0, (i - 1) * 30),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Text = opt,
+            Font = Enum.Font.Gotham,
+            TextSize = 12,
+            TextColor3 = T.text,
+            AutoButtonColor = false,
+            ZIndex = 31,
+            Parent = popup,
+        }).MouseButton1Click:Connect(function()
+            currentIndex = i
+            boxText.Text = opt
+            open = false
+            popup.Visible = false
+            row.ZIndex = 9
+            if onChange then pcall(onChange, opt, i) end
+        end)
+    end
+    box.MouseButton1Click:Connect(function()
+        open = not open
+        popup.Visible = open
+        row.ZIndex = open and 24 or 9
+    end)
+    return row
+end
+
+local function addSlider(page, name, minV, maxV, step, suffix, current, onChange)
+    local row = mk("Frame", {
+        Name = "Slider_" .. name,
+        Size = UDim2.new(1, 0, 0, 58),
+        BackgroundColor3 = T.panel,
+        BorderSizePixel = 0,
+        LayoutOrder = layoutOrder(page),
+        ZIndex = 9,
+        Parent = page,
+    })
+    rounded(row, 9)
+    mk("TextLabel", {
+        Size = UDim2.new(1, -140, 0, 20),
+        Position = UDim2.new(0, 0, 0, 6),
+        BackgroundTransparency = 1,
+        Text = name,
+        Font = Enum.Font.Gotham,
+        TextSize = 13,
+        TextColor3 = T.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ZIndex = 10,
+        Parent = row,
+    })
+    local valLbl = mk("TextLabel", {
+        Size = UDim2.fromOffset(120, 20),
+        Position = UDim2.new(1, -126, 0, 6),
+        BackgroundTransparency = 1,
+        Text = "",
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextColor3 = T.gold,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        ZIndex = 10,
+        Parent = row,
+    })
+    local bar = mk("Frame", {
+        Name = "Bar",
+        Size = UDim2.new(1, -20, 0, 5),
+        Position = UDim2.new(0, 10, 0, 40),
+        BackgroundColor3 = Color3.fromRGB(60, 60, 76),
+        BorderSizePixel = 0,
+        ZIndex = 11,
+        Parent = row,
+    })
+    rounded(bar, 3)
+    local fill = mk("Frame", {
+        Name = "Fill",
+        Size = UDim2.fromScale(0, 1),
+        BackgroundColor3 = T.gold,
+        BorderSizePixel = 0,
+        ZIndex = 12,
+        Parent = bar,
+    })
+    rounded(fill, 3)
+    local knob = mk("TextButton", {
+        Name = "Knob",
+        Size = UDim2.fromOffset(16, 16),
+        Position = UDim2.new(0, -8, 0.5, -8),
+        BackgroundColor3 = T.gold,
+        BorderSizePixel = 0,
+        Text = "",
+        AutoButtonColor = false,
+        ZIndex = 13,
+        Parent = bar,
+    })
+    local val = math.clamp(math.round(current / step) * step, minV, maxV)
+    local function fromMouse()
+        local m = UserInputService:GetMouseLocation()
+        local x = m.X - bar.AbsolutePosition.X
+        local f = math.clamp(x / math.max(1, bar.AbsoluteSize.X), 0, 1)
+        val = math.clamp(minV + math.round((maxV - minV) * f / step) * step, minV, maxV)
+    end
+    local function paint()
+        local frac = (val - minV) / math.max(1, maxV - minV)
+        fill.Size = UDim2.fromScale(frac, 1)
+        knob.Position = UDim2.new(frac, -8, 0.5, -8)
+        valLbl.Text = tostring(val) .. suffix
+    end
+    local sliding = false
+    bar.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            sliding = true
+            fromMouse()
+            paint()
+            if onChange then pcall(onChange, val) end
+        end
+    end)
+    knob.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            sliding = true
+            fromMouse()
+            paint()
+            if onChange then pcall(onChange, val) end
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then sliding = false end
+    end)
+    RunService.RenderStepped:Connect(function()
+        if sliding then
+            fromMouse()
+            paint()
+            if onChange then pcall(onChange, val) end
+        end
+    end)
+    paint()
+    return row
+end
+
+local function addButton(page, name, onClick)
+    local b = mk("TextButton", {
+        Name = "Btn_" .. name,
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = T.panel,
+        BorderSizePixel = 0,
+        Text = name,
+        Font = Enum.Font.Gotham,
+        TextSize = 13,
+        TextColor3 = T.gold,
+        AutoButtonColor = false,
+        LayoutOrder = layoutOrder(page),
+        ZIndex = 9,
+        Parent = page,
+    })
+    rounded(b, 9)
+    b.MouseEnter:Connect(function() b.BackgroundColor3 = T.panel2 end)
+    b.MouseLeave:Connect(function() b.BackgroundColor3 = T.panel end)
+    b.MouseButton1Click:Connect(function()
+        if onClick then pcall(onClick) end
+    end)
+    return b
+end
+
+-- ---------------- Home tab: introduction ----------------
+addSection(tabFrames.home, "Introduction")
+local introCard = mk("Frame", {
+    Name = "IntroCard",
+    Size = UDim2.new(1, 0, 0, 236),
+    BackgroundColor3 = T.panel,
+    BorderSizePixel = 0,
+    LayoutOrder = layoutOrder(tabFrames.home),
+    ZIndex = 9,
+    Parent = tabFrames.home,
+})
+rounded(introCard, 9)
+
+mk("TextLabel", {
+    Size = UDim2.new(1, -32, 0, 30),
+    Position = UDim2.new(0, 16, 0, 12),
+    BackgroundTransparency = 1,
+    Text = "NEXUS HUB",
+    Font = Enum.Font.GothamBold,
+    TextSize = 18,
+    TextColor3 = T.text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 10,
+    Parent = introCard,
+})
+mk("TextLabel", {
+    Size = UDim2.new(1, -32, 0, 36),
+    Position = UDim2.new(0, 16, 0, 42),
+    BackgroundTransparency = 1,
+    Text = "Welcome! Nexus Hub is an all-in-one control panel for this session — every toggle here runs beside the game.",
+    Font = Enum.Font.Gotham,
+    TextSize = 13,
+    TextColor3 = T.textDim,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    ZIndex = 10,
+    Parent = introCard,
+})
+
+local introRows = {
+    { "Rebirth Farm", "Auto tower runs + 2-farm upgrade + rebirth." },
+    { "Farm",         "Feeder upgrades, tower sends, strategy." },
+    { "Fighting",     "Arena automation, chaos on full health." },
+    { "Misc",         "Coop, recycler, incubator, eggs, fusing." },
+    { "Server",       "Hops, rejoin, auto-load, auto-reconnect." },
+}
+for i, row in ipairs(introRows) do
+    local y = 86 + (i - 1) * 26
+    local wrapper = mk("Frame", {
+        Size = UDim2.new(1, -48, 0, 20),
+        Position = UDim2.new(0, 16, 0, y),
+        BackgroundTransparency = 1,
+        LayoutOrder = 10 + i,
+        ZIndex = 10,
+        Parent = introCard,
+    })
+    local dot = mk("Frame", {
+        Size = UDim2.fromOffset(6, 6),
+        Position = UDim2.new(0, 0, 0, 7),
+        BackgroundColor3 = T.gold,
+        BorderSizePixel = 0,
+        ZIndex = 10,
+        Parent = wrapper,
+    })
+    rounded(dot, 3)
+    mk("TextLabel", {
+        Size = UDim2.new(0, 118, 0, 20),
+        Position = UDim2.new(0, 14, 0, 0),
+        BackgroundTransparency = 1,
+        Text = row[1],
+        Font = Enum.Font.GothamBold,
+        TextSize = 12.5,
+        TextColor3 = T.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 10,
+        Parent = wrapper,
+    })
+    mk("TextLabel", {
+        Size = UDim2.new(1, -140, 0, 22),
+        Position = UDim2.new(0, 132, 0, 0),
+        BackgroundTransparency = 1,
+        Text = row[2],
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextColor3 = T.textDim,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        ZIndex = 10,
+        Parent = wrapper,
+    })
+end
+
+mk("TextLabel", {
+    Size = UDim2.new(1, -32, 0, 20),
+    Position = UDim2.new(0, 16, 0, 214),
+    BackgroundTransparency = 1,
+    Text = "Tip: click the yellow  N  bubble to hide or show this window anytime.",
+    Font = Enum.Font.Gotham,
+    TextSize = 12,
+    TextColor3 = T.goldLo,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 10,
+    Parent = introCard,
+})
+
+-- on reload, tear down the previous run's window so windows don't stack.
+-- Deliberately does NOT call killAllNexusWindows: that sweep is gen-aware, but
+-- a live-reload from a pre-rejoin generation can fire its teardown late, after
+-- a newer run has already rebuilt the window, and a non-gen-aware sweep here
+-- would murder the brand-new window. Only our own objects are touched; the
+-- next run's pre-build sweep handles any true leftovers.
 if STATE then
     STATE.onCleanup(function()
-        pcall(function() if win then win:Unload() end end)
-        killAllNexusWindows()
+        pcall(function() if sg then sg:Destroy() end end)
         pcall(function() if ultraOverlay then ultraOverlay:Destroy() end end)
         pcall(function() RunService:Set3dRenderingEnabled(true) end)
-        getgenv().NexusHubWin = nil
+        if getgenv().NexusHubWin == sg then getgenv().NexusHubWin = nil end
     end)
 end
 
@@ -1169,30 +2131,21 @@ local toggles = {
     { "fight",  "Fighting",   "Auto Chaos",                 "chaos",                  runAutoChaos },
 }
 
-local tabs = {
-    rfarm = win:CreateTab({ Name = "Rebirth Farm", Icon = "flame" }),
-    farm = win:CreateTab({ Name = "Farm", Icon = "home" }),
-    misc = win:CreateTab({ Name = "Misc", Icon = "settings" }),
-    fight = win:CreateTab({ Name = "Fighting", Icon = "sword" }),
-    server = win:CreateTab({ Name = "Server", Icon = "globe" }),
-}
-
-local sections = {} -- tabKey -> sectionName -> section element (reused, created once)
+-- Register every loop toggle onto its page, grouped under section headers.
+local lastSection = {}
 for _, t in ipairs(toggles) do
-    local tabKey, sectionName, name, flagKey, fn = t[1], t[2], t[3], t[4], t[5]
-    sections[tabKey] = sections[tabKey] or {}
-    if not sections[tabKey][sectionName] then
-        sections[tabKey][sectionName] = tabs[tabKey]:CreateSection({ Name = sectionName })
+    local page = tabFrames[t[1]]
+    if not page then continue end
+    local section, name, flagKey, fn = t[2], t[3], t[4], t[5]
+    if lastSection[t[1]] ~= section then
+        addSection(page, section)
+        lastSection[t[1]] = section
     end
-    tabs[tabKey]:CreateToggle({
-        Name = name,
-        Default = flags[flagKey] == true,
-        Callback = function(v)
-            flags[flagKey] = v
-            if v then spawnLoop(flagKey, fn) end
-        end,
-    })
+    addToggle(page, name, flagKey, function(v)
+        if v then spawnLoop(flagKey, fn) end
+    end)
 end
+pcall(syncCanvas)
 
 -- Auto Farm tower start strategy (Auto Send Tower uses this to pick the floor)
 local strategyOptions = {
@@ -1200,234 +2153,74 @@ local strategyOptions = {
     "Warm Up At Floor",
     "Start From The Bottom",
 }
-tabs.farm:CreateDropdown({
-    Name = "Tower Strategy",
-    Options = strategyOptions,
-    CurrentOption = { "Straight To Your Frontier" },
-    MultipleOptions = false,
-    Callback = function(opts)
-        local picked = (type(opts) == "table" and opts[1]) or opts
-        if picked == "Warm Up At Floor" then
-            flags.towerStrategy = "warmup"
-        elseif picked == "Start From The Bottom" then
-            flags.towerStrategy = "bottom"
-        else
-            flags.towerStrategy = "frontier"
-        end
-    end,
-})
+addSection(tabFrames.farm, "Tower & Eggs")
+local stratIndex = (flags.towerStrategy == "warmup" and 2)
+    or (flags.towerStrategy == "bottom" and 3)
+    or 1
+addDropdown(tabFrames.farm, "Tower Strategy", strategyOptions, stratIndex, function(opt)
+    if opt == "Warm Up At Floor" then
+        flags.towerStrategy = "warmup"
+    elseif opt == "Start From The Bottom" then
+        flags.towerStrategy = "bottom"
+    else
+        flags.towerStrategy = "frontier"
+    end
+end)
 
 -- Farm: how far to scan for world egg drops when Auto Collect Eggs is on
-tabs.farm:CreateSlider({
-    Name = "Collect Egg Scan Radius",
-    Range = { 30, 500 },
-    Increment = 10,
-    Suffix = " studs",
-    CurrentValue = flags.collectEggRadius or 200,
-    Callback = function(v)
-        flags.collectEggRadius = v
-    end,
-})
+addSlider(tabFrames.farm, "Collect Egg Scan Radius", 30, 500, 10, " studs",
+    flags.collectEggRadius or 200, function(v) flags.collectEggRadius = v end)
+pcall(syncCanvas)
 
 -- Misc / Utilities: the two performance toggles are immediate effects, not loops
-tabs.misc:CreateToggle({
-    Name = "Performance Mode",
-    Default = flags.performance == true,
-    Callback = function(v)
-        flags.performance = v
-        applyPerformance(v)
-    end,
-})
-tabs.misc:CreateToggle({
-    Name = "Ultra Performance Mode",
-    Default = flags.ultraPerformance == true,
-    Callback = function(v)
-        flags.ultraPerformance = v
-        applyUltraPerformance(v)
-    end,
-})
+addToggle(tabFrames.misc, "Performance Mode", "performance", function(v)
+    applyPerformance(v)
+end)
+addToggle(tabFrames.misc, "Ultra Performance Mode", "ultraPerformance", function(v)
+    applyUltraPerformance(v)
+end)
 
 -- Misc / Hub: unload everything
-tabs.misc:CreateSection({ Name = "Hub" })
-tabs.misc:CreateButton({
-    Name = "Unload Nexus Hub",
-    Callback = function()
-        -- kill every loop (hubAlive gates on this) and reset all flags
-        getgenv().NX_HUB = false
-        for k in pairs(flags) do flags[k] = false end
-        -- restore rendering + remove the black overlay if it was on
-        pcall(function() RunService:Set3dRenderingEnabled(true) end)
-        pcall(function() if ultraOverlay then ultraOverlay:Destroy() end end)
-        -- destroy the GUI (and any leftover hub windows)
-        pcall(function() if win then win:Unload() end end)
-        killAllNexusWindows()
-        getgenv().NexusHubWin = nil
-        getgenv().NX_HUB = nil
-    end,
-})
-
--- Config tab: removed (config auto save / load disabled)
+addSection(tabFrames.misc, "Hub")
+addButton(tabFrames.misc, "Unload Nexus Hub", function()
+    -- kill every loop (hubAlive gates on this) and reset all flags
+    getgenv().NX_HUB = false
+    for k in pairs(flags) do flags[k] = false end
+    -- restore rendering + remove the black overlay if it was on
+    pcall(function() RunService:Set3dRenderingEnabled(true) end)
+    pcall(function() if ultraOverlay then ultraOverlay:Destroy() end end)
+    -- destroy the GUI (and any leftover hub windows)
+    pcall(function() if sg then sg:Destroy() end end)
+    killAllNexusWindows(true)
+    getgenv().NexusHubWin = nil
+    getgenv().NX_HUB = nil
+end)
 
 -- Server tab: same-place server hopping + rejoin
-tabs.server:CreateSection({ Name = "Server" })
-tabs.server:CreateButton({
-    Name = "Server Hop",
-    Callback = function()
-        serverHop()
-    end,
-})
-tabs.server:CreateButton({
-    Name = "Server Hop Low Players",
-    Callback = function()
-        serverHopLow()
-    end,
-})
-tabs.server:CreateButton({
-    Name = "Rejoin",
-    Callback = function()
-        rejoin()
-    end,
-})
-tabs.server:CreateToggle({
-    Name = "Auto Load on Teleport",
-    Default = flags.autoLoadOnTeleport == true,
-    Callback = function(v)
-        flags.autoLoadOnTeleport = v
-        if v then task.spawn(runQueueKeepAlive) end
-    end,
-})
-tabs.server:CreateToggle({
-    Name = "Auto Reconnect (rejoin on kick / 20 min idle)",
-    Default = flags.autoReconnect == true,
-    Callback = function(v)
-        flags.autoReconnect = v
-        if v then task.spawn(runAutoReconnect) end
-    end,
-})
+addSection(tabFrames.server, "Server")
+addButton(tabFrames.server, "Server Hop", function()
+    serverHop()
+end)
+addButton(tabFrames.server, "Server Hop Low Players", function()
+    serverHopLow()
+end)
+addButton(tabFrames.server, "Rejoin", function()
+    rejoin()
+end)
+addToggle(tabFrames.server, "Auto Load on Teleport", "autoLoadOnTeleport", function(v)
+    if v then task.spawn(runQueueKeepAlive) end
+end)
+addToggle(tabFrames.server, "Auto Reconnect (rejoin on kick / 20 min idle)", "autoReconnect", function(v)
+    if v then task.spawn(runAutoReconnect) end
+end)
+
+-- land on the Home tab and reveal the window
+pcall(function() switchTab("home") end)
 
 -- apply any states already active this run (loops gate on these flags)
 if flags.performance then applyPerformance(true) end
 if flags.ultraPerformance then applyUltraPerformance(true) end
 if flags.autoReconnect then task.spawn(runAutoReconnect) end
 if flags.autoLoadOnTeleport then task.spawn(runQueueKeepAlive) end
-
--- ------------------------------------------------------------------
--- LIVE STAT TRACKER overlay
--- A small draggable on-screen panel that reads live stats straight from
--- the client memory (client:get snapshots) and updates them in a loop,
--- without affecting gameplay.
--- ------------------------------------------------------------------
-local statGui = nil
-local statLabels = {}
-local statShow = false
-local UserInputService = game:GetService("UserInputService")
-local function towerData()
-    local ok, t = pcall(function() return client:get({ "tower" }) end)
-    return (ok and type(t) == "table") and t or {}
-end
-
-local function buildStatGui()
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "NEXUSStatTracker"
-    sg.ResetOnSpawn = false
-    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    sg.Parent = Player.PlayerGui
-
-    local bg = Instance.new("Frame")
-    bg.Name = "Panel"
-    bg.Size = UDim2.fromOffset(210, 150)
-    bg.Position = UDim2.new(0, 12, 1, -162)
-    bg.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
-    bg.BackgroundTransparency = 0.15
-    bg.BorderSizePixel = 0
-    bg.Parent = sg
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, 0, 0, 24)
-    title.BackgroundColor3 = Color3.fromRGB(40, 40, 58)
-    title.BackgroundTransparency = 0.4
-    title.Font = Enum.Font.GothamBold
-    title.Text = "LIVE STATS"
-    title.TextSize = 14
-    title.TextColor3 = Color3.fromRGB(255, 220, 120)
-    title.Parent = bg
-
-    -- make the panel draggable from its title bar
-    local dragging, dragOff = false, Vector2.new()
-    title.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging, dragOff = true, inp.Position - bg.AbsolutePosition
-        end
-    end)
-    title.InputEnded:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
-    end)
-    game:GetService("RunService").RenderStepped:Connect(function()
-        if dragging then
-            local vp = game:GetService("GuiService"):GetScreenResolution()
-            local mouse = UserInputService:GetMouseLocation()
-            bg.Position = UDim2.fromOffset(
-                math.clamp(mouse.X - dragOff.X, 0, vp.X),
-                math.clamp(mouse.Y - dragOff.Y, 0, vp.Y)
-            )
-        end
-    end)
-
-    local function rowLabel(y)
-        local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(1, -12, 0, 20)
-        lbl.Position = UDim2.new(0, 6, 0, y)
-        lbl.BackgroundTransparency = 1
-        lbl.Font = Enum.Font.Gotham
-        lbl.TextSize = 13
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.TextColor3 = Color3.fromRGB(230, 230, 240)
-        lbl.Parent = bg
-        return lbl
-    end
-
-    statLabels.best = rowLabel(30)
-    statLabels.peak = rowLabel(52)
-    statLabels.time = rowLabel(74)
-    statLabels.rebirth = rowLabel(96)
-    statLabels.money = rowLabel(118)
-
-    sg.Enabled = statShow
-    statGui = sg
-end
-
--- continuous updater: reads client memory and paints the labels
-local function runStatTracker()
-    while hubAlive() do
-        if statShow and statGui and statGui.Enabled then
-            local t = towerData()
-            local rb = rebirthCount()
-            local m = money()
-            statLabels.best.Text = string.format("Best floor   %s", tostring(t.best or "—"))
-            statLabels.peak.Text = string.format("Peak floor   %s", tostring(t.peak or "—"))
-            local bt = t.bestTime
-            statLabels.time.Text = string.format("Best time    %s", (type(bt) == "number") and (string.format("%.2fs", bt)) or "—")
-            statLabels.rebirth.Text = string.format("Rebirths     %s", tostring(rb or 0))
-            statLabels.money.Text = string.format("Money        %s", tostring(m or 0))
-        end
-        task.wait(0.5)
-    end
-end
-
--- toggle in the Misc/Utilities section
-tabs.misc:CreateToggle({
-    Name = "Live Stats Tracker",
-    Default = false,
-    Callback = function(v)
-        statShow = v
-        if v then
-            if not statGui then buildStatGui() end
-            statGui.Enabled = true
-            task.spawn(runStatTracker)
-        else
-            if statGui then statGui.Enabled = false end
-        end
-    end,
-})
 
 getgenv().NX_HUB = true
